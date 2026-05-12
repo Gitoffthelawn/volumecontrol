@@ -1,5 +1,37 @@
-// popup.js
 const browserApi = (typeof browser !== 'undefined') ? browser : chrome;
+const cached = {
+  slider: null,
+  volumeText: null,
+  monoCheckbox: null,
+  rememberCheckbox: null,
+  enableCheckbox: null
+};
+
+function storageGet(keys) {
+  return new Promise((resolve, reject) => {
+    try {
+      browserApi.storage.local.get(keys, (res) => {
+        if (browserApi.runtime.lastError) reject(browserApi.runtime.lastError);
+        else resolve(res);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function storageSet(obj) {
+  return new Promise((resolve, reject) => {
+    try {
+      browserApi.storage.local.set(obj, () => {
+        if (browserApi.runtime.lastError) reject(browserApi.runtime.lastError);
+        else resolve();
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+} 
 
 function extractRootDomain(url) {
     if (!url) return null;
@@ -12,8 +44,21 @@ function extractRootDomain(url) {
     return domain.toLowerCase();
 }
 
+function getSiteSettingsKey(siteSettings, domain) {
+    if (!siteSettings || !domain) return null;
+    if (siteSettings[domain]) return domain;
+
+    return Object.keys(siteSettings)
+        .filter(savedDomain => domain === savedDomain || domain.endsWith(`.${savedDomain}`))
+        .sort((a, b) => b.length - a.length)[0] || null;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-  // Settings Button
+  const slider = document.getElementById('volume-slider');
+  if (slider) {
+      slider.focus();
+  }
+
   const settingsBtn = document.getElementById('settings');
   if (settingsBtn) {
       settingsBtn.addEventListener('click', () => {
@@ -27,10 +72,15 @@ document.addEventListener('DOMContentLoaded', () => {
       });
   }
 
-  // Handle Messages
   browserApi.runtime.onMessage.addListener((message) => {
     if (message.type === "exclusion") showError({ type: "exclusion" });
   });
+
+  document.addEventListener('keydown', () => {
+    if (slider && document.activeElement !== slider) {
+      slider.focus();
+    }
+  }, { once: true });
 
   listenForEvents();
 });
@@ -63,146 +113,213 @@ function handleTabs(tabs) {
 
     browserApi.tabs.sendMessage(currentTab.id, { command: "checkExclusion" }, (response) => {
         if (browserApi.runtime.lastError) {
-            showError({ type: "exclusion" });
+            // Content script didn't respond — fall back to storage check to decide whether the page is truly excluded.
+            (async () => {
+                try {
+                    const domain = extractRootDomain(currentTab.url);
+                    if (!domain) {
+                        showError({ type: "exclusion" });
+                        return;
+                    }
+                    const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
+                    let isExcluded = false;
+                    if (data.whitelistMode) {
+                        isExcluded = !getSiteSettingsKey(data.siteSettings || {}, domain);
+                    } else {
+                        isExcluded = data.fqdns.includes(domain);
+                    }
+                    if (isExcluded) showError({ type: "exclusion" });
+                } catch (e) {
+                    showError({ type: "exclusion" });
+                }
+            })();
         }
     });
     
     initializeControls(currentTab);
 }
 
-function updateEnableSwitch(tab) {
+async function updateEnableSwitch(tab) {
     const checkbox = document.getElementById('enable-checkbox');
     const switchLabel = document.querySelector('label[for="enable-checkbox"]');
     const domain = extractRootDomain(tab.url);
     
     if (!domain) {
-        if(switchLabel) switchLabel.style.display = 'none';
+        if (switchLabel) switchLabel.style.display = 'none';
         return;
     } else {
-        if(switchLabel) switchLabel.style.display = 'flex';
+        if (switchLabel) switchLabel.style.display = 'flex';
     }
 
-    browserApi.storage.local.get({ fqdns: [], whitelist: [], whitelistMode: false }, (data) => {
-        let isExcluded = false;
-        
+    try {
+        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
+
+        // When whitelist mode is active, remembered sites determine which pages are allowed.
+        // Hide the enable/active switch to avoid duplicate controls and potential user confusion.
         if (data.whitelistMode) {
-            isExcluded = !data.whitelist.includes(domain);
-        } else {
-            isExcluded = data.fqdns.includes(domain);
+            if (switchLabel) switchLabel.style.display = 'none';
+            return;
         }
 
-        checkbox.checked = !isExcluded;
+        let isExcluded = data.fqdns.includes(domain);
+
+        if (checkbox) checkbox.checked = !isExcluded;
 
         checkbox.onchange = (e) => {
             const isActive = e.target.checked;
-            toggleSitePermission(domain, data, !isActive, tab.id);
+            toggleSitePermission(domain, !isActive, tab.id);
         };
-    });
-}
-
-function toggleSitePermission(domain, data, shouldExclude, tabId) {
-    let newData = {};
-
-    if (data.whitelistMode) {
-        newData.whitelist = data.whitelist || [];
-        if (shouldExclude) {
-            const idx = newData.whitelist.indexOf(domain);
-            if (idx > -1) newData.whitelist.splice(idx, 1);
-        } else {
-            if (!newData.whitelist.includes(domain)) newData.whitelist.push(domain);
-        }
-    } else {
-        newData.fqdns = data.fqdns || [];
-        if (shouldExclude) {
-            if (!newData.fqdns.includes(domain)) newData.fqdns.push(domain);
-        } else {
-            const idx = newData.fqdns.indexOf(domain);
-            if (idx > -1) newData.fqdns.splice(idx, 1);
-        }
+    } catch (e) {
+        handleError(e);
     }
+} 
 
-    browserApi.storage.local.set(newData, () => {
+async function toggleSitePermission(domain, shouldExclude, tabId) {
+    try {
+        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false });
+        const newData = {};
+
+        if (data.whitelistMode) {
+            // Edit remembered sites instead of an arbitrary whitelist
+            const sd = await storageGet({ siteSettings: {} });
+            const settings = sd.siteSettings || {};
+            if (shouldExclude) {
+                if (settings[domain]) {
+                    delete settings[domain];
+                    await storageSet({ siteSettings: settings });
+                }
+            } else {
+                if (!settings[domain]) {
+                    settings[domain] = { volume: 0, mono: false };
+                    await storageSet({ siteSettings: settings });
+                    // Try to apply settings immediately to the tab that requested the change
+                    if (tabId) {
+                        try {
+                            browserApi.tabs.sendMessage(tabId, { command: "setVolume", dB: settings[domain].volume }, () => {});
+                            browserApi.tabs.sendMessage(tabId, { command: "setMono", mono: Boolean(settings[domain].mono) }, () => {});
+                        } catch (e) { /* ignore */ }
+                    }
+                }
+            }
+        } else {
+            newData.fqdns = data.fqdns || [];
+            if (shouldExclude) {
+                if (!newData.fqdns.includes(domain)) newData.fqdns.push(domain);
+            } else {
+                const idx = newData.fqdns.indexOf(domain);
+                if (idx > -1) newData.fqdns.splice(idx, 1);
+            }
+            await storageSet({ fqdns: newData.fqdns });
+        }
+
         browserApi.tabs.reload(tabId);
-        window.close(); 
-    });
-}
+        window.close();
+    } catch (e) {
+        handleError(e);
+    }
+} 
 
-// --- ERROR HANDLING FIX ---
-function err(error) {
+function handleError(error) {
   const msg = error.message || error;
   if (typeof msg === 'string') {
-      // Ignore common connectivity errors that aren't critical
-      if (msg.includes("Receiving end does not exist") || 
+      if (msg.includes("Receiving end does not exist") ||
           msg.includes("Could not establish connection") ||
-          msg.includes("message channel closed") // <--- Added this check
+          msg.includes("message channel closed")
       ) {
-          return; 
+          return;
       }
   }
   console.error(`Volume Control: Error: ${msg}`);
 }
 
 function formatValue(dB) {
-  return `${dB >= 0 ? '+' : ''}${dB} dB`;
+  const n = Number(dB);
+  if (Number.isNaN(n)) return '';
+  return `${n >= 0 ? '+' : ''}${n} dB`;
 }
 
-function saveSiteSettings(tab) {
-    const rememberCheckbox = document.getElementById("remember-checkbox");
-    if (!rememberCheckbox || !rememberCheckbox.checked || !tab || !tab.url) return;
+async function saveSiteSettings(tab) {
+    try {
+        const rememberCheckbox = document.getElementById("remember-checkbox");
+        if (!rememberCheckbox || !rememberCheckbox.checked || !tab || !tab.url) return;
 
-    const domain = extractRootDomain(tab.url);
-    if (!domain) return;
+        const domain = extractRootDomain(tab.url);
+        if (!domain) return;
 
-    const volumeSlider = document.getElementById("volume-slider");
-    const monoCheckbox = document.getElementById("mono-checkbox");
+        const volumeSlider = cached.slider || document.getElementById("volume-slider");
+        const monoCheckbox = cached.monoCheckbox || document.getElementById("mono-checkbox");
 
-    browserApi.storage.local.get({ siteSettings: {} }, (data) => {
-        data.siteSettings[domain] = {
-            volume: parseInt(volumeSlider.value),
-            mono: monoCheckbox.checked        
+        const data = await storageGet({ siteSettings: {} });
+        data.siteSettings = data.siteSettings || {};
+        const settingsKey = getSiteSettingsKey(data.siteSettings, domain) || domain;
+        data.siteSettings[settingsKey] = {
+            volume: parseInt(volumeSlider?.value, 10) || 0,
+            mono: Boolean(monoCheckbox?.checked)
         };
-        browserApi.storage.local.set({ siteSettings: data.siteSettings });
-    });
-}
+        await storageSet({ siteSettings: data.siteSettings });
 
-function setVolume(dB, tab) {
-  const slider = document.querySelector("#volume-slider");
-  const text = document.querySelector("#volume-text");
-  slider.value = dB;
-  text.value = formatValue(dB);
-  
-  if (tab) {
-      browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB }, (response) => {
-          if(browserApi.runtime.lastError) err(browserApi.runtime.lastError);
-      });
-      saveSiteSettings(tab); 
-  }
-}
-
-function toggleMono(tab) {
-  const monoCheckbox = document.querySelector("#mono-checkbox");
-  if(tab) {
-      browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: monoCheckbox.checked }, (res) => {
-           if(browserApi.runtime.lastError) err(browserApi.runtime.lastError);
-      });
-      saveSiteSettings(tab); 
-  }
-}
-
-function toggleRemember(tab) {
-    const rememberCheckbox = document.getElementById("remember-checkbox");
-    const domain = extractRootDomain(tab.url);
-    if (!domain) return;
-
-    if (rememberCheckbox.checked) {
-        saveSiteSettings(tab);
-    } else {
-        browserApi.storage.local.get({ siteSettings: {} }, (data) => {
-            if (data.siteSettings[domain]) {
-                delete data.siteSettings[domain];
-                browserApi.storage.local.set({ siteSettings: data.siteSettings });
+        // Notify the content script in this tab immediately so volume/mono are applied without waiting
+        if (tab && tab.id) {
+            try {
+                browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB: data.siteSettings[settingsKey].volume }, () => {
+                    if (browserApi.runtime && browserApi.runtime.lastError) {
+                        // It's possible the content script hasn't injected into the page yet; ignore harmless errors.
+                    }
+                });
+                browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: Boolean(data.siteSettings[settingsKey].mono) }, () => {
+                    if (browserApi.runtime && browserApi.runtime.lastError) {}
+                });
+            } catch (e) {
+                // ignore messaging errors
             }
-        });
+        }
+    } catch (e) {
+        handleError(e);
+    }
+} 
+
+async function setVolume(dB, tab) {
+  const slider = cached.slider || document.querySelector("#volume-slider");
+  const text = cached.volumeText || document.querySelector("#volume-text");
+  if (slider) slider.value = String(dB);
+  if (text) text.value = formatValue(dB);
+
+  if (tab) {
+      browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB: Number(dB) }, (response) => {
+          if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
+      });
+      await saveSiteSettings(tab);
+  }
+}
+
+async function toggleMono(tab) {
+  const monoCheckbox = cached.monoCheckbox || document.querySelector("#mono-checkbox");
+  if (tab && monoCheckbox) {
+      browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: monoCheckbox.checked }, (res) => {
+           if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
+      });
+      await saveSiteSettings(tab);
+  }
+}
+
+async function toggleRemember(tab) {
+    try {
+        const rememberCheckbox = document.getElementById("remember-checkbox");
+        const domain = extractRootDomain(tab.url);
+        if (!domain) return;
+
+        if (rememberCheckbox && rememberCheckbox.checked) {
+            await saveSiteSettings(tab);
+        } else {
+            const data = await storageGet({ siteSettings: {} });
+            const settingsKey = getSiteSettingsKey(data.siteSettings, domain);
+            if (data.siteSettings && settingsKey) {
+                delete data.siteSettings[settingsKey];
+                await storageSet({ siteSettings: data.siteSettings });
+            }
+        }
+    } catch (e) {
+        handleError(e);
     }
 }
 
@@ -232,7 +349,7 @@ function showError(error) {
   }
 }
 
-function initializeControls(tab) {
+async function initializeControls(tab) {
     if (!tab) return;
 
     const volumeSlider = document.querySelector("#volume-slider");
@@ -240,28 +357,45 @@ function initializeControls(tab) {
     const monoCheckbox = document.querySelector("#mono-checkbox");
     const rememberCheckbox = document.querySelector("#remember-checkbox");
 
-    volumeSlider.addEventListener("input", () => {
-        document.querySelector("#volume-text").value = formatValue(volumeSlider.value);
-        setVolume(volumeSlider.value, tab);
-    });
-    
-    volumeText.addEventListener("change", () => {
-         const val = volumeText.value.match(/-?\d+/)?.[0];
-         if(val) setVolume(val, tab);
-    });
+    cached.slider = volumeSlider;
+    cached.volumeText = volumeText;
+    cached.monoCheckbox = monoCheckbox;
+    cached.rememberCheckbox = rememberCheckbox;
 
-    monoCheckbox.addEventListener("change", () => toggleMono(tab));
-    rememberCheckbox.addEventListener("change", () => toggleRemember(tab));
+    if (volumeSlider) {
+      volumeSlider.addEventListener("input", () => {
+          if (cached.volumeText) cached.volumeText.value = formatValue(volumeSlider.value);
+          setVolume(volumeSlider.value, tab);
+      });
+    }
+    
+    if (volumeText) {
+      volumeText.addEventListener("change", () => {
+           const val = volumeText.value.match(/-?\d+/)?.[0];
+           if (val) setVolume(val, tab);
+      });
+    }
+
+    if (monoCheckbox) monoCheckbox.addEventListener("change", () => toggleMono(tab));
+    if (rememberCheckbox) rememberCheckbox.addEventListener("change", () => toggleRemember(tab));
 
     const domain = extractRootDomain(tab.url);
     if (!domain) return;
 
-    browserApi.storage.local.get({ siteSettings: {} }, (data) => {
-        const saved = data.siteSettings[domain];
+    try {
+        const data = await storageGet({ siteSettings: {} });
+        const settingsKey = getSiteSettingsKey(data.siteSettings || {}, domain);
+        const saved = settingsKey ? data.siteSettings[settingsKey] : null;
         if (saved) {
-            rememberCheckbox.checked = true;
-            if (saved.volume !== undefined) setVolume(saved.volume, null); 
-            if (saved.mono !== undefined) monoCheckbox.checked = saved.mono;
+            if (rememberCheckbox) rememberCheckbox.checked = true;
+            if (saved.volume !== undefined) setVolume(saved.volume, null);
+            if (saved.mono !== undefined && monoCheckbox) monoCheckbox.checked = saved.mono;
+            browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB: Number(saved.volume) || 0 }, () => {
+                if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
+            });
+            browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: Boolean(saved.mono) }, () => {
+                if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
+            });
         } else {
             browserApi.tabs.sendMessage(tab.id, { command: "getVolume" }, (response) => {
                 if (!browserApi.runtime.lastError && response && response.response !== undefined) {
@@ -270,9 +404,11 @@ function initializeControls(tab) {
             });
             browserApi.tabs.sendMessage(tab.id, { command: "getMono" }, (response) => {
                 if (!browserApi.runtime.lastError && response && response.response !== undefined) {
-                    monoCheckbox.checked = response.response;
+                    if (monoCheckbox) monoCheckbox.checked = response.response;
                 }
             });
         }
-    });
+    } catch (e) {
+        handleError(e);
+    }
 }

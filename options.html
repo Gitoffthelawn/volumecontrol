@@ -17,24 +17,42 @@
         
         /* Layout */
         .row { margin-bottom: 15px; }
-        .input-group { display: flex; gap: 10px; margin-bottom: 10px;}
+        .input-group { display: flex; gap: 10px; margin-bottom: 10px; align-items: center;}
         
         /* Input & Button */
-        input[type="text"] {
+        input[type="text"], .vol-input, .domain-input {
             flex-grow: 1;
-            padding: 8px;
+            padding: 8px 10px;
             border: 1px solid #ccc;
             border-radius: 4px;
+            height: 36px;
+            box-sizing: border-box;
+            background: #fff;
         }
-        button#addFqdn {
+        .vol-input {
+            width: 60px;
+            padding: 6px 8px;
+            text-align: center;
+            flex-grow: 0;
+        }
+        .domain-input {
+            flex-grow: 1;
+            border: none;
+            background: transparent;
+            padding: 6px 8px;
+            min-width: 0;
+        }
+        button#addFqdn, button#addRemembered {
             padding: 8px 15px;
             background-color: #4CAF50;
             color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
+            height: 36px;
+            box-sizing: border-box;
         }
-        button#addFqdn:hover { background-color: #45a049; }
+        button#addFqdn:hover, button#addRemembered:hover { background-color: #45a049; }
 
         /* Lists */
         .list-container {
@@ -49,8 +67,8 @@
             padding: 8px 10px; 
             border-bottom: 1px solid #eee; 
             display: flex; 
-            justify-content: space-between; 
             align-items: center;
+            gap: 12px;
             background: #fff;
         }
         .list-entry:last-child { border-bottom: none; }
@@ -65,6 +83,23 @@
 
         /* Entry Details */
         .domain-info { flex-grow: 1; font-weight: 500; font-size: 0.95em; }
+        .domain-input {
+            flex: 1 1 auto;
+            font-weight: 500;
+            font-size: 0.95em;
+            border: 1px solid transparent;
+            background: transparent;
+            padding: 6px 10px;
+            height: 36px;
+            border-radius: 4px;
+            box-sizing: border-box;
+            min-width: 0;
+        }
+        .domain-input:focus {
+            outline: none;
+            border-color: #4CAF50;
+            background-color: rgba(76,175,80,0.04);
+        }
         
         .controls-container {
             display: flex;
@@ -76,21 +111,31 @@
         .setting-group {
             display: flex;
             align-items: center;
+            gap: 8px;
             font-size: 0.9em;
             color: #555;
             background: #f5f5f5;
             padding: 4px 8px;
             border-radius: 4px;
             border: 1px solid #e0e0e0;
+            height: 36px;
+            box-sizing: border-box;
         }
         
         .vol-input {
-            width: 40px;
-            padding: 2px 4px;
-            margin: 0 4px;
+            width: 84px; /* widened to fit '-## dB' */
+            min-width: 64px;
+            height: 30px;
+            padding: 2px 10px;
             border: 1px solid #ccc;
             border-radius: 3px;
             text-align: center;
+            line-height: 1;
+            box-sizing: border-box;
+            align-self: center;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .mono-label {
@@ -106,17 +151,17 @@
             background: transparent; 
             color: #ccc;
             border: none;
-            width: 24px;
-            height: 24px;
+            width: 36px;
+            height: 36px;
             border-radius: 50%;
             cursor: pointer;
             font-weight: bold;
-            font-size: 20px;
+            font-size: 18px;
             line-height: 1;
             display: flex;
             align-items: center;
             justify-content: center;
-            margin-left: 10px;
+            margin-left: 0;
         }
         .remove-btn:hover {
             background: #ffebee;
@@ -195,7 +240,7 @@
             Enable Whitelist Mode
         </label>
         <span class="hint">
-            <strong>Checked:</strong> Extension ONLY runs on sites listed below.<br>
+            <strong>Checked:</strong> Extension ONLY runs on sites you have remembered (in Remembered Settings). Enabling whitelist mode will move your current blacklist into an archive (so it can be restored if you switch back).<br>
             <strong>Unchecked:</strong> Extension runs everywhere EXCEPT sites listed below.
         </span>
     </div>
@@ -211,6 +256,10 @@
     <h3>Remembered Settings</h3>
     <div class="hint" style="margin-bottom: 10px; margin-left:0;">
         Manage saved volume and mono settings for specific sites.
+    </div>
+    <div class="input-group">
+        <input type="text" id="newRememberedSite" placeholder="example.com">
+        <button id="addRemembered">Add</button>
     </div>
     <div id="memoryList" class="list-container">
         </div>
