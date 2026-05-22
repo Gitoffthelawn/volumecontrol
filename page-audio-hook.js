@@ -2,6 +2,9 @@
     const HOOK_KEY = "__volumeControlPageAudioHook";
     const BRIDGE_SOURCE = "volume-control-extension";
     const BRIDGE_TARGET = "volume-control-page-audio";
+    const MEDIA_MANAGED_ATTR = "vcPageAudioManaged";
+    const MIN_DB = -32;
+    const MAX_DB = 32;
 
     if (window[HOOK_KEY] && window[HOOK_KEY].installed) return;
 
@@ -35,9 +38,14 @@
         if (state.debugMode) console.log(`[VolumeControl/PageAudio] ${msg}`);
     }
 
+    function normalizeDb(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return 0;
+        return Math.max(MIN_DB, Math.min(MAX_DB, Math.round(n)));
+    }
+
     function getGainValue(dB) {
-        const n = Number(dB);
-        if (Number.isNaN(n)) return 1.0;
+        const n = normalizeDb(dB);
         return Math.pow(10, n / 20);
     }
 
@@ -160,10 +168,18 @@
     function suspendMediaContextIfIdle() {
         if (!mediaAudioContext || mediaAudioContext.state !== "running") return;
 
+        let hasActiveRoute = false;
         for (const element of Array.from(mediaElements)) {
-            if (mediaRoutes.has(element) && isMediaPlaying(element) && isAudibleMediaElement(element)) {
-                return;
+            const route = mediaRoutes.get(element);
+            if (route && route.outputConnected && isMediaPlaying(element) && isAudibleMediaElement(element)) {
+                hasActiveRoute = true;
+                break;
             }
+        }
+        if (hasActiveRoute) return;
+
+        for (const element of Array.from(mediaElements)) {
+            disconnectMediaRouteOutput(mediaRoutes.get(element));
         }
 
         try {
@@ -172,6 +188,30 @@
             }
         } catch (e) {
             log(`media context suspend failed: ${e && e.message}`);
+        }
+    }
+
+    function disconnectMediaRouteOutput(route) {
+        if (!route) return;
+
+        safeDisconnect(route.gain);
+        safeDisconnect(route.splitter);
+        safeDisconnect(route.leftGain);
+        safeDisconnect(route.rightGain);
+        safeDisconnect(route.merger);
+        route.outputConnected = false;
+    }
+
+    function releaseMediaRoute(element) {
+        const route = mediaRoutes.get(element);
+        if (!route) return;
+
+        disconnectMediaRouteOutput(route);
+
+        try {
+            setNativeVolume(element, getMediaState(element).baseVolume);
+        } catch (e) {
+            log(`media release volume restore failed: ${e && e.message}`);
         }
     }
 
@@ -270,21 +310,6 @@
         }
     }
 
-    function getMediaCaptureStream(element) {
-        const capture = element.captureStream || element.mozCaptureStream || element.mozCaptureStreamUntilEnded;
-        if (typeof capture !== "function") return null;
-
-        try {
-            const stream = capture.call(element);
-            if (!stream || typeof stream.getAudioTracks !== "function") return null;
-            if (!stream.getAudioTracks().length) return null;
-            return stream;
-        } catch (e) {
-            log(`media captureStream failed: ${e && e.message}`);
-            return null;
-        }
-    }
-
     function getMediaSourceUrl(element) {
         const directSrc = element.currentSrc || element.src;
         if (directSrc) return directSrc;
@@ -295,13 +320,6 @@
         } catch (e) {
             return "";
         }
-    }
-
-    function canUseCaptureStreamRoute(context) {
-        if (getGainValue(state.dB) <= 1 || typeof context.createMediaStreamSource !== "function") {
-            return false;
-        }
-        return true;
     }
 
     function isLikelyCrossOriginMedia(element) {
@@ -316,27 +334,9 @@
         }
     }
 
-    function createCaptureStreamRouteSource(context, element) {
-        if (!canUseCaptureStreamRoute(context)) return null;
-        const stream = getMediaCaptureStream(element);
-        if (!stream) return null;
-
-        try {
-            return {
-                source: markNode(context.createMediaStreamSource(stream)),
-                kind: "captureStream",
-                stream
-            };
-        } catch (e) {
-            log(`createMediaStreamSource failed: ${e && e.message}`);
-            return null;
-        }
-    }
-
     function createMediaRouteSource(context, element) {
+        // captureStream() adds a delayed parallel copy, so blocked media falls back to native volume.
         if (isLikelyCrossOriginMedia(element)) {
-            const captureSource = createCaptureStreamRouteSource(context, element);
-            if (captureSource) return captureSource;
             log(`skipping MediaElementAudioSource for cross-origin media: ${getMediaSourceUrl(element)}`);
             return null;
         }
@@ -350,7 +350,7 @@
             log(`createMediaElementSource failed: ${e && e.message}`);
         }
 
-        return createCaptureStreamRouteSource(context, element);
+        return null;
     }
 
     function readNativeVolume(element) {
@@ -367,6 +367,7 @@
     function setNativeVolume(element, value) {
         const entry = getMediaState(element);
         entry.applyingVolume = true;
+        entry.ignoreVolumeEventsUntil = Date.now() + 100;
         try {
             if (nativeVolumeDescriptor && nativeVolumeDescriptor.set) {
                 nativeVolumeDescriptor.set.call(element, value);
@@ -384,6 +385,7 @@
             entry = {
                 baseVolume: readNativeVolume(element),
                 applyingVolume: false,
+                ignoreVolumeEventsUntil: 0,
                 listenersInstalled: false
             };
             mediaState.set(element, entry);
@@ -462,10 +464,7 @@
     }
 
     function wireMediaRoute(route) {
-        const requestedGain = state.enabled ? getGainValue(state.dB) : 1.0;
-        const targetGain = route.sourceKind === "captureStream"
-            ? Math.max(0, requestedGain - 1)
-            : requestedGain;
+        const targetGain = state.enabled ? getGainValue(state.dB) : 1.0;
 
         try {
             const now = route.context.currentTime;
@@ -478,15 +477,7 @@
             log(`media gain update failed: ${e && e.message}`);
         }
 
-        safeDisconnect(route.gain);
-        safeDisconnect(route.splitter);
-        safeDisconnect(route.leftGain);
-        safeDisconnect(route.rightGain);
-        safeDisconnect(route.merger);
-
-        if (route.sourceKind === "captureStream" && targetGain <= 0) {
-            return;
-        }
+        disconnectMediaRouteOutput(route);
 
         try {
             if (state.enabled && state.mono) {
@@ -502,6 +493,7 @@
             } else {
                 connectNative(route.gain, route.context.destination);
             }
+            route.outputConnected = true;
         } catch (e) {
             log(`media graph wire failed: ${e && e.message}`);
         }
@@ -539,7 +531,7 @@
                 rightGain,
                 merger,
                 sourceKind: routeSource.kind,
-                stream: routeSource.stream || null
+                outputConnected: false
             };
             mediaRoutes.set(element, route);
             wireMediaRoute(route);
@@ -556,22 +548,29 @@
 
         const entry = getMediaState(element);
         const gain = state.enabled ? getGainValue(state.dB) : 1.0;
-        const shouldUseRoute = Boolean(
-            mediaRoutes.has(element) ||
-            options.forceRoute ||
-            isMediaPlaying(element)
-        );
-        const route = shouldUseRoute ? (mediaRoutes.get(element) || ensureMediaRoute(element)) : null;
+        const existingRoute = mediaRoutes.get(element);
+        const playing = isMediaPlaying(element);
+        const audible = isAudibleMediaElement(element);
+
+        if (!playing || !audible) {
+            if (existingRoute) disconnectMediaRouteOutput(existingRoute);
+
+            const nativeVolume = existingRoute
+                ? entry.baseVolume
+                : Math.max(0, Math.min(1, entry.baseVolume * Math.min(gain, 1)));
+            setNativeVolume(element, nativeVolume);
+            return;
+        }
+
+        const route = existingRoute || (options.forceRoute || mediaNeedsAudioRoute()
+            ? ensureMediaRoute(element)
+            : null);
 
         if (route) {
-            const nativeVolume = route.sourceKind === "captureStream" && gain <= 1
-                ? Math.max(0, Math.min(1, entry.baseVolume * Math.min(gain, 1)))
-                : entry.baseVolume;
-            setNativeVolume(element, nativeVolume);
+            setNativeVolume(element, entry.baseVolume);
             wireMediaRoute(route);
-            if (isMediaPlaying(element) && isAudibleMediaElement(element)) {
-                resumeContext(route.context);
-            }
+            if (route.outputConnected) resumeContext(route.context);
+            else setTimeout(suspendMediaContextIfIdle, 250);
             return;
         }
 
@@ -588,21 +587,41 @@
     function registerMediaElement(element, options = {}) {
         if (!isMediaElement(element)) return element;
 
+        try {
+            if (element.dataset) element.dataset[MEDIA_MANAGED_ATTR] = "true";
+        } catch (e) {
+            log(`media marker failed: ${e && e.message}`);
+        }
+
         mediaElements.add(element);
         const entry = getMediaState(element);
         if (!entry.listenersInstalled && typeof element.addEventListener === "function") {
             const applyOnPlay = () => {
+                mediaElements.add(element);
                 applyMediaElementState(element, { forceRoute: true });
-                resumeContext(mediaAudioContext);
             };
-            const suspendWhenIdle = () => setTimeout(suspendMediaContextIfIdle, 250);
+            const suspendWhenIdle = () => {
+                if (!isMediaPlaying(element)) {
+                    disconnectMediaRouteOutput(mediaRoutes.get(element));
+                }
+                setTimeout(suspendMediaContextIfIdle, 250);
+            };
+            const applyOnVolumeChange = () => {
+                const currentEntry = getMediaState(element);
+                if (currentEntry.ignoreVolumeEventsUntil > Date.now()) return;
+
+                applyMediaElementState(element);
+                setTimeout(suspendMediaContextIfIdle, 250);
+            };
             const release = () => {
+                releaseMediaRoute(element);
                 mediaElements.delete(element);
-                suspendWhenIdle();
+                setTimeout(suspendMediaContextIfIdle, 250);
             };
 
             element.addEventListener("play", applyOnPlay, { passive: true });
             element.addEventListener("playing", applyOnPlay, { passive: true });
+            element.addEventListener("volumechange", applyOnVolumeChange, { passive: true });
             element.addEventListener("pause", suspendWhenIdle, { passive: true });
             element.addEventListener("ended", release, { passive: true });
             element.addEventListener("emptied", release, { passive: true });
@@ -711,7 +730,6 @@
 
         window.HTMLMediaElement.prototype.play = function patchedPlay() {
             registerMediaElement(this, { forceRoute: true });
-            resumeContext(mediaAudioContext);
             return nativePlay.apply(this, arguments);
         };
 
@@ -777,24 +795,6 @@
         }
     }
 
-    function installMediaObserver() {
-        if (!window.MutationObserver || !document.documentElement) return;
-
-        try {
-            const observer = new MutationObserver(mutations => {
-                for (const mutation of mutations) {
-                    for (const node of mutation.addedNodes) {
-                        if (isMediaElement(node)) registerMediaElement(node);
-                        else if (node && node.querySelectorAll) scanMediaElements(node);
-                    }
-                }
-            });
-            observer.observe(document.documentElement, { childList: true, subtree: true });
-        } catch (e) {
-            log(`media observer failed: ${e && e.message}`);
-        }
-    }
-
     function handleBridgeMessage(event) {
         if (event.source !== window) return;
 
@@ -803,7 +803,7 @@
         if (data.command !== "setState") return;
 
         state.enabled = data.enabled !== false;
-        state.dB = Number(data.dB) || 0;
+        state.dB = normalizeDb(data.dB);
         state.mono = Boolean(data.mono);
         state.debugMode = Boolean(data.debugMode);
 
@@ -835,11 +835,9 @@
     if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", () => {
             scanMediaElements(document);
-            installMediaObserver();
         }, { once: true });
     } else {
         scanMediaElements(document);
-        installMediaObserver();
     }
 
     window.addEventListener("message", handleBridgeMessage);

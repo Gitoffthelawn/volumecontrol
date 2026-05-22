@@ -1,37 +1,92 @@
-const browserApi = (typeof browser !== 'undefined') ? browser : chrome;
+const browserApi = (typeof browser !== 'undefined') ? browser : (typeof chrome !== 'undefined' ? chrome : null);
+const MIN_DB = -32;
+const MAX_DB = 32;
+const BOOST_LIMIT_NOTE = "Boosting and mono may be unavailable on this media because the browser only allows fallback volume control. You can still lower volume.";
 const cached = {
   slider: null,
   volumeText: null,
+  limitNote: null,
   monoCheckbox: null,
   rememberCheckbox: null,
-  enableCheckbox: null
+  enableCheckbox: null,
+  maxDb: MAX_DB,
+  boostLimited: false
 };
 
-function storageGet(keys) {
+function normalizeDb(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(MIN_DB, Math.min(MAX_DB, Math.round(n)));
+}
+
+function normalizeControlDb(value) {
+  return Math.min(normalizeDb(value), cached.maxDb);
+}
+
+function getRuntimeLastError() {
+  return browserApi && browserApi.runtime ? browserApi.runtime.lastError : null;
+}
+
+function callApi(method, args = []) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const callback = (value) => {
+      finish(getRuntimeLastError(), value);
+    };
+
     try {
-      browserApi.storage.local.get(keys, (res) => {
-        if (browserApi.runtime.lastError) reject(browserApi.runtime.lastError);
-        else resolve(res);
-      });
-    } catch (e) {
-      reject(e);
+      const result = method(...args, callback);
+      if (result && typeof result.then === 'function') {
+        result.then((value) => finish(null, value), (error) => finish(error));
+      }
+    } catch (callbackError) {
+      try {
+        const result = method(...args);
+        if (result && typeof result.then === 'function') {
+          result.then((value) => finish(null, value), (error) => finish(error));
+        } else {
+          finish(null, result);
+        }
+      } catch (promiseError) {
+        finish(promiseError || callbackError);
+      }
     }
   });
 }
 
+function storageGet(keys) {
+  return callApi(browserApi.storage.local.get.bind(browserApi.storage.local), [keys]);
+}
+
 function storageSet(obj) {
-  return new Promise((resolve, reject) => {
-    try {
-      browserApi.storage.local.set(obj, () => {
-        if (browserApi.runtime.lastError) reject(browserApi.runtime.lastError);
-        else resolve();
-      });
-    } catch (e) {
-      reject(e);
-    }
-  });
+  return callApi(browserApi.storage.local.set.bind(browserApi.storage.local), [obj]).then(() => undefined);
 } 
+
+function tabsQuery(queryInfo) {
+  return callApi(browserApi.tabs.query.bind(browserApi.tabs), [queryInfo]);
+}
+
+function tabsSendMessage(tabId, message) {
+  return callApi(browserApi.tabs.sendMessage.bind(browserApi.tabs), [tabId, message]);
+}
+
+function runtimeSendMessage(message) {
+  return callApi(browserApi.runtime.sendMessage.bind(browserApi.runtime), [message]);
+}
+
+function tabsReload(tabId) {
+  return callApi(browserApi.tabs.reload.bind(browserApi.tabs), [tabId]).then(() => undefined);
+}
+
+function openOptionsPage() {
+  return callApi(browserApi.runtime.openOptionsPage.bind(browserApi.runtime)).then(() => undefined);
+}
 
 function extractRootDomain(url) {
     if (!url) return null;
@@ -49,8 +104,21 @@ function getSiteSettingsKey(siteSettings, domain) {
     if (siteSettings[domain]) return domain;
 
     return Object.keys(siteSettings)
-        .filter(savedDomain => domain === savedDomain || domain.endsWith(`.${savedDomain}`))
+        .filter(savedDomain => domainMatchesSaved(domain, savedDomain))
         .sort((a, b) => b.length - a.length)[0] || null;
+}
+
+function normalizeSavedDomain(value) {
+    if (!value) return "";
+    let domain = String(value).trim().toLowerCase();
+    domain = domain.replace(/^(https?|ftp):\/\/(www\.)?/, '');
+    domain = domain.split('/')[0].split(':')[0];
+    return domain;
+}
+
+function domainMatchesSaved(domain, savedDomain) {
+    const saved = normalizeSavedDomain(savedDomain);
+    return Boolean(domain && saved && (domain === saved || domain.endsWith(`.${saved}`)));
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -63,9 +131,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (settingsBtn) {
       settingsBtn.addEventListener('click', () => {
           if (browserApi.runtime.openOptionsPage) {
-              browserApi.runtime.openOptionsPage(() => {
-                  if (browserApi.runtime.lastError) console.error(browserApi.runtime.lastError);
-              });
+              openOptionsPage().catch(console.error);
           } else {
               window.open(browserApi.runtime.getURL('options.html'));
           }
@@ -86,9 +152,9 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function listenForEvents() {
-  browserApi.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      handleTabs(tabs);
-  });
+  tabsQuery({ active: true, currentWindow: true })
+      .then(handleTabs)
+      .catch(handleError);
 }
 
 function handleTabs(tabs) {
@@ -111,28 +177,24 @@ function handleTabs(tabs) {
 
     updateEnableSwitch(currentTab);
 
-    browserApi.tabs.sendMessage(currentTab.id, { command: "checkExclusion" }, (response) => {
-        if (browserApi.runtime.lastError) {
-            // Content script didn't respond — fall back to storage check to decide whether the page is truly excluded.
-            (async () => {
-                try {
-                    const domain = extractRootDomain(currentTab.url);
-                    if (!domain) {
-                        showError({ type: "exclusion" });
-                        return;
-                    }
-                    const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
-                    let isExcluded = false;
-                    if (data.whitelistMode) {
-                        isExcluded = !getSiteSettingsKey(data.siteSettings || {}, domain);
-                    } else {
-                        isExcluded = data.fqdns.includes(domain);
-                    }
-                    if (isExcluded) showError({ type: "exclusion" });
-                } catch (e) {
-                    showError({ type: "exclusion" });
-                }
-            })();
+    tabsSendMessage(currentTab.id, { command: "checkExclusion" }).catch(async () => {
+        // Content script didn't respond; fall back to storage to decide whether the page is truly excluded.
+        try {
+            const domain = extractRootDomain(currentTab.url);
+            if (!domain) {
+                showError({ type: "exclusion" });
+                return;
+            }
+            const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
+            let isExcluded = false;
+            if (data.whitelistMode) {
+                isExcluded = !getSiteSettingsKey(data.siteSettings || {}, domain);
+            } else {
+                isExcluded = (data.fqdns || []).some(savedDomain => domainMatchesSaved(domain, savedDomain));
+            }
+            if (isExcluded) showError({ type: "exclusion" });
+        } catch (e) {
+            showError({ type: "exclusion" });
         }
     });
     
@@ -161,7 +223,7 @@ async function updateEnableSwitch(tab) {
             return;
         }
 
-        let isExcluded = data.fqdns.includes(domain);
+        let isExcluded = (data.fqdns || []).some(savedDomain => domainMatchesSaved(domain, savedDomain));
 
         if (checkbox) checkbox.checked = !isExcluded;
 
@@ -195,8 +257,8 @@ async function toggleSitePermission(domain, shouldExclude, tabId) {
                     // Try to apply settings immediately to the tab that requested the change
                     if (tabId) {
                         try {
-                            browserApi.tabs.sendMessage(tabId, { command: "setVolume", dB: settings[domain].volume }, () => {});
-                            browserApi.tabs.sendMessage(tabId, { command: "setMono", mono: Boolean(settings[domain].mono) }, () => {});
+                            tabsSendMessage(tabId, { command: "setVolume", dB: settings[domain].volume }).catch(() => {});
+                            tabsSendMessage(tabId, { command: "setMono", mono: Boolean(settings[domain].mono) }).catch(() => {});
                         } catch (e) { /* ignore */ }
                     }
                 }
@@ -212,7 +274,7 @@ async function toggleSitePermission(domain, shouldExclude, tabId) {
             await storageSet({ fqdns: newData.fqdns });
         }
 
-        browserApi.tabs.reload(tabId);
+        await tabsReload(tabId);
         window.close();
     } catch (e) {
         handleError(e);
@@ -233,9 +295,55 @@ function handleError(error) {
 }
 
 function formatValue(dB) {
-  const n = Number(dB);
-  if (Number.isNaN(n)) return '';
+  const n = normalizeDb(dB);
   return `${n >= 0 ? '+' : ''}${n} dB`;
+}
+
+function setDisplayedVolume(dB) {
+  const normalizedDb = normalizeControlDb(dB);
+  const slider = cached.slider || document.querySelector("#volume-slider");
+  const text = cached.volumeText || document.querySelector("#volume-text");
+
+  if (slider) slider.value = String(normalizedDb);
+  if (text) text.value = formatValue(normalizedDb);
+
+  return normalizedDb;
+}
+
+function applyAudioControlState(state = {}) {
+  const maxDb = Number.isFinite(Number(state.maxDb)) ? normalizeDb(state.maxDb) : MAX_DB;
+
+  cached.maxDb = Math.min(MAX_DB, Math.max(MIN_DB, maxDb));
+  cached.boostLimited = Boolean(state.boostLimited) || cached.maxDb <= 0;
+
+  const slider = cached.slider || document.querySelector("#volume-slider");
+  const note = cached.limitNote || document.querySelector("#volume-limit-note");
+
+  if (slider) {
+    slider.max = String(cached.maxDb);
+    slider.style.setProperty("--vc-range-steps", String(Math.max(1, cached.maxDb - MIN_DB)));
+    if (normalizeDb(slider.value) > cached.maxDb) setDisplayedVolume(cached.maxDb);
+  }
+
+  if (note) {
+    note.textContent = state.limitation || BOOST_LIMIT_NOTE;
+    note.classList.toggle("hidden", !cached.boostLimited);
+  }
+}
+
+async function refreshAudioControlState(tab) {
+    if (!tab || tab.id === undefined) return null;
+
+    const response = await tabsSendMessage(tab.id, { command: "getAudioControlState" }).catch(handleError);
+    const state = response && response.response ? response.response : null;
+
+    if (state) {
+        applyAudioControlState(state);
+        if (state.volume !== undefined) setDisplayedVolume(state.volume);
+        if (state.mono !== undefined && cached.monoCheckbox) cached.monoCheckbox.checked = Boolean(state.mono);
+    }
+
+    return state;
 }
 
 async function saveSiteSettings(tab) {
@@ -253,7 +361,7 @@ async function saveSiteSettings(tab) {
         data.siteSettings = data.siteSettings || {};
         const settingsKey = getSiteSettingsKey(data.siteSettings, domain) || domain;
         data.siteSettings[settingsKey] = {
-            volume: parseInt(volumeSlider?.value, 10) || 0,
+            volume: normalizeControlDb(volumeSlider?.value),
             mono: Boolean(monoCheckbox?.checked)
         };
         await storageSet({ siteSettings: data.siteSettings });
@@ -261,14 +369,10 @@ async function saveSiteSettings(tab) {
         // Notify the content script in this tab immediately so volume/mono are applied without waiting
         if (tab && tab.id) {
             try {
-                browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB: data.siteSettings[settingsKey].volume }, () => {
-                    if (browserApi.runtime && browserApi.runtime.lastError) {
-                        // It's possible the content script hasn't injected into the page yet; ignore harmless errors.
-                    }
+                tabsSendMessage(tab.id, { command: "setVolume", dB: data.siteSettings[settingsKey].volume }).catch(() => {
+                    // It's possible the content script hasn't injected into the page yet; ignore harmless errors.
                 });
-                browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: Boolean(data.siteSettings[settingsKey].mono) }, () => {
-                    if (browserApi.runtime && browserApi.runtime.lastError) {}
-                });
+                tabsSendMessage(tab.id, { command: "setMono", mono: Boolean(data.siteSettings[settingsKey].mono) }).catch(() => {});
             } catch (e) {
                 // ignore messaging errors
             }
@@ -278,16 +382,29 @@ async function saveSiteSettings(tab) {
     }
 } 
 
-async function setVolume(dB, tab) {
-  const slider = cached.slider || document.querySelector("#volume-slider");
-  const text = cached.volumeText || document.querySelector("#volume-text");
-  if (slider) slider.value = String(dB);
-  if (text) text.value = formatValue(dB);
+async function setVolume(dB, tab, options = {}) {
+  let normalizedDb = setDisplayedVolume(dB);
 
   if (tab) {
-      browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB: Number(dB) }, (response) => {
-          if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
-      });
+      const response = await tabsSendMessage(tab.id, {
+          command: "setVolume",
+          dB: normalizedDb
+      }).catch(handleError);
+
+      if (response && response.response) {
+          applyAudioControlState(response.response);
+          if (response.response.volume !== undefined) {
+              normalizedDb = setDisplayedVolume(response.response.volume);
+          }
+      }
+
+      if (options.showFeedback !== false) {
+          runtimeSendMessage({
+              command: "showNativeVolumeFeedback",
+              tabId: tab.id,
+              dB: normalizedDb
+          }).catch(() => {});
+      }
       await saveSiteSettings(tab);
   }
 }
@@ -295,9 +412,7 @@ async function setVolume(dB, tab) {
 async function toggleMono(tab) {
   const monoCheckbox = cached.monoCheckbox || document.querySelector("#mono-checkbox");
   if (tab && monoCheckbox) {
-      browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: monoCheckbox.checked }, (res) => {
-           if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
-      });
+      tabsSendMessage(tab.id, { command: "setMono", mono: monoCheckbox.checked }).catch(handleError);
       await saveSiteSettings(tab);
   }
 }
@@ -354,25 +469,29 @@ async function initializeControls(tab) {
 
     const volumeSlider = document.querySelector("#volume-slider");
     const volumeText = document.querySelector("#volume-text");
+    const limitNote = document.querySelector("#volume-limit-note");
     const monoCheckbox = document.querySelector("#mono-checkbox");
     const rememberCheckbox = document.querySelector("#remember-checkbox");
 
     cached.slider = volumeSlider;
     cached.volumeText = volumeText;
+    cached.limitNote = limitNote;
     cached.monoCheckbox = monoCheckbox;
     cached.rememberCheckbox = rememberCheckbox;
 
+    applyAudioControlState({ maxDb: MAX_DB, boostLimited: false, limitation: "" });
+
     if (volumeSlider) {
       volumeSlider.addEventListener("input", () => {
-          if (cached.volumeText) cached.volumeText.value = formatValue(volumeSlider.value);
-          setVolume(volumeSlider.value, tab);
+          const normalizedDb = setDisplayedVolume(volumeSlider.value);
+          setVolume(normalizedDb, tab);
       });
     }
     
     if (volumeText) {
       volumeText.addEventListener("change", () => {
            const val = volumeText.value.match(/-?\d+/)?.[0];
-           if (val) setVolume(val, tab);
+           if (val) setVolume(normalizeDb(val), tab);
       });
     }
 
@@ -383,30 +502,24 @@ async function initializeControls(tab) {
     if (!domain) return;
 
     try {
+        const audioState = await refreshAudioControlState(tab);
         const data = await storageGet({ siteSettings: {} });
         const settingsKey = getSiteSettingsKey(data.siteSettings || {}, domain);
         const saved = settingsKey ? data.siteSettings[settingsKey] : null;
         if (saved) {
             if (rememberCheckbox) rememberCheckbox.checked = true;
-            if (saved.volume !== undefined) setVolume(saved.volume, null);
             if (saved.mono !== undefined && monoCheckbox) monoCheckbox.checked = saved.mono;
-            browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB: Number(saved.volume) || 0 }, () => {
-                if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
-            });
-            browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: Boolean(saved.mono) }, () => {
-                if (browserApi.runtime.lastError) handleError(browserApi.runtime.lastError);
-            });
-        } else {
-            browserApi.tabs.sendMessage(tab.id, { command: "getVolume" }, (response) => {
-                if (!browserApi.runtime.lastError && response && response.response !== undefined) {
-                    setVolume(response.response, null);
+            if (saved.volume !== undefined) await setVolume(saved.volume, tab, { showFeedback: false });
+            tabsSendMessage(tab.id, { command: "setMono", mono: Boolean(saved.mono) }).catch(handleError);
+        } else if (!audioState) {
+            tabsSendMessage(tab.id, { command: "getVolume" }).then((response) => {
+                if (response && response.response !== undefined) setVolume(response.response, null);
+            }).catch(handleError);
+            tabsSendMessage(tab.id, { command: "getMono" }).then((response) => {
+                if (response && response.response !== undefined && monoCheckbox) {
+                    monoCheckbox.checked = response.response;
                 }
-            });
-            browserApi.tabs.sendMessage(tab.id, { command: "getMono" }, (response) => {
-                if (!browserApi.runtime.lastError && response && response.response !== undefined) {
-                    if (monoCheckbox) monoCheckbox.checked = response.response;
-                }
-            });
+            }).catch(handleError);
         }
     } catch (e) {
         handleError(e);
