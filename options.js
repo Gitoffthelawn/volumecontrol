@@ -1,76 +1,16 @@
-const browserApi = (typeof browser !== 'undefined') ? browser : (typeof chrome !== 'undefined' ? chrome : null);
-const MIN_DB = -32;
-const MAX_DB = 32;
-
-function normalizeDb(value) {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return 0;
-    return Math.max(MIN_DB, Math.min(MAX_DB, Math.round(n)));
-}
-
-function normalizeDomainInput(value) {
-    if (!value) return "";
-    let domain = String(value).trim().toLowerCase();
-    domain = domain.replace(/^(https?|ftp):\/\/(www\.)?/, '');
-    domain = domain.split('/')[0].split(':')[0];
-    return domain;
-}
-
-function getRuntimeLastError() {
-    return browserApi && browserApi.runtime ? browserApi.runtime.lastError : null;
-}
-
-function callApi(method, args = []) {
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        const finish = (error, value) => {
-            if (settled) return;
-            settled = true;
-            if (error) reject(error);
-            else resolve(value);
-        };
-        const callback = (value) => {
-            finish(getRuntimeLastError(), value);
-        };
-
-        try {
-            const result = method(...args, callback);
-            if (result && typeof result.then === 'function') {
-                result.then((value) => finish(null, value), (error) => finish(error));
-            }
-        } catch (callbackError) {
-            try {
-                const result = method(...args);
-                if (result && typeof result.then === 'function') {
-                    result.then((value) => finish(null, value), (error) => finish(error));
-                } else {
-                    finish(null, result);
-                }
-            } catch (promiseError) {
-                finish(promiseError || callbackError);
-            }
-        }
-    });
-}
-
-function formatDb(v) {
-    const n = normalizeDb(v);
-    return `${n >= 0 ? '+' : ''}${n} dB`;
-}
+const {
+    browserApi,
+    normalizeDb,
+    normalizeDomainInput,
+    formatDb,
+    storageGet,
+    storageSet
+} = globalThis.VolumeControlShared;
 
 // debounce timer for memory list rendering to avoid double-renders when storage changes
 let memoryListRenderTimeout = null;
 // debounce for fqdn list updates
 let fqdnListRenderTimeout = null;
-
-function storageGet(keys) {
-    return callApi(browserApi.storage.local.get.bind(browserApi.storage.local), [keys]);
-}
-
-function storageSet(obj) {
-    return callApi(browserApi.storage.local.set.bind(browserApi.storage.local), [obj]).then(() => undefined);
-}
-
 
 function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
     const entry = document.createElement('div');
@@ -143,7 +83,7 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
         const numeric = Number.isFinite(v) ? normalizeDb(v) : normalizeDb(volInput.dataset.numericValue);
         volInput.dataset.numericValue = String(numeric);
         volInput.value = formatDb(numeric);
-        onUpdate(domain, { volume: numeric, mono: Boolean(monoCheckbox.checked) });
+        onUpdate(domain, { volume: numeric, mono: Boolean(monoCheckbox.checked), muted: Boolean(muteCheckbox.checked) });
     };
 
     volInput.addEventListener('blur', commitVol);
@@ -161,10 +101,27 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
     monoLabel.appendChild(monoText);
 
     monoCheckbox.addEventListener('change', () => {
-        onUpdate(domain, { volume: normalizeDb(volInput.dataset.numericValue), mono: Boolean(monoCheckbox.checked) });
+        onUpdate(domain, { volume: normalizeDb(volInput.dataset.numericValue), mono: Boolean(monoCheckbox.checked), muted: Boolean(muteCheckbox.checked) });
     });
 
     settingGroup.appendChild(monoLabel);
+
+    // Mute checkbox
+    const muteLabel = document.createElement('label');
+    muteLabel.className = 'mono-label';
+    const muteCheckbox = document.createElement('input');
+    muteCheckbox.type = 'checkbox';
+    muteCheckbox.checked = Boolean(settings && settings.muted);
+    muteLabel.appendChild(muteCheckbox);
+    const muteText = document.createElement('span');
+    muteText.textContent = 'Mute';
+    muteLabel.appendChild(muteText);
+
+    muteCheckbox.addEventListener('change', () => {
+        onUpdate(domain, { volume: normalizeDb(volInput.dataset.numericValue), mono: Boolean(monoCheckbox.checked), muted: Boolean(muteCheckbox.checked) });
+    });
+
+    settingGroup.appendChild(muteLabel);
 
     controls.appendChild(settingGroup);
 
@@ -213,7 +170,7 @@ async function renderMemoryList() {
                 delete settings[domain];
                 await storageSet({ siteSettings: settings });
             }, async (domain, newVal) => {
-                settings[domain] = { volume: normalizeDb(newVal.volume), mono: !!newVal.mono };
+                settings[domain] = { volume: normalizeDb(newVal.volume), mono: !!newVal.mono, muted: !!newVal.muted };
                 await storageSet({ siteSettings: settings });
             }, async (oldDomain, newDomain) => {
                 const nd = normalizeDomainInput(newDomain);

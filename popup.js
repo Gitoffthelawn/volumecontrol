@@ -1,6 +1,21 @@
-const browserApi = (typeof browser !== 'undefined') ? browser : (typeof chrome !== 'undefined' ? chrome : null);
-const MIN_DB = -32;
-const MAX_DB = 32;
+const {
+  browserApi,
+  MIN_DB,
+  MAX_DB,
+  normalizeDb,
+  formatDb,
+  storageGet,
+  storageSet,
+  tabsQuery,
+  tabsSendMessage,
+  runtimeSendMessage,
+  tabsReload,
+  openOptionsPage,
+  domainMatchesSaved,
+  getSiteSettingsKey,
+  isHarmlessMessageError
+} = globalThis.VolumeControlShared;
+const sharedExtractRootDomain = globalThis.VolumeControlShared.extractRootDomain;
 const BOOST_LIMIT_NOTE = "Boosting and mono may be unavailable on this media because the browser only allows fallback volume control. You can still lower volume.";
 const cached = {
   slider: null,
@@ -9,116 +24,17 @@ const cached = {
   monoCheckbox: null,
   rememberCheckbox: null,
   enableCheckbox: null,
+  muteBtn: null,
   maxDb: MAX_DB,
   boostLimited: false
 };
-
-function normalizeDb(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(MIN_DB, Math.min(MAX_DB, Math.round(n)));
-}
 
 function normalizeControlDb(value) {
   return Math.min(normalizeDb(value), cached.maxDb);
 }
 
-function getRuntimeLastError() {
-  return browserApi && browserApi.runtime ? browserApi.runtime.lastError : null;
-}
-
-function callApi(method, args = []) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const callback = (value) => {
-      finish(getRuntimeLastError(), value);
-    };
-
-    try {
-      const result = method(...args, callback);
-      if (result && typeof result.then === 'function') {
-        result.then((value) => finish(null, value), (error) => finish(error));
-      }
-    } catch (callbackError) {
-      try {
-        const result = method(...args);
-        if (result && typeof result.then === 'function') {
-          result.then((value) => finish(null, value), (error) => finish(error));
-        } else {
-          finish(null, result);
-        }
-      } catch (promiseError) {
-        finish(promiseError || callbackError);
-      }
-    }
-  });
-}
-
-function storageGet(keys) {
-  return callApi(browserApi.storage.local.get.bind(browserApi.storage.local), [keys]);
-}
-
-function storageSet(obj) {
-  return callApi(browserApi.storage.local.set.bind(browserApi.storage.local), [obj]).then(() => undefined);
-} 
-
-function tabsQuery(queryInfo) {
-  return callApi(browserApi.tabs.query.bind(browserApi.tabs), [queryInfo]);
-}
-
-function tabsSendMessage(tabId, message) {
-  return callApi(browserApi.tabs.sendMessage.bind(browserApi.tabs), [tabId, message]);
-}
-
-function runtimeSendMessage(message) {
-  return callApi(browserApi.runtime.sendMessage.bind(browserApi.runtime), [message]);
-}
-
-function tabsReload(tabId) {
-  return callApi(browserApi.tabs.reload.bind(browserApi.tabs), [tabId]).then(() => undefined);
-}
-
-function openOptionsPage() {
-  return callApi(browserApi.runtime.openOptionsPage.bind(browserApi.runtime)).then(() => undefined);
-}
-
 function extractRootDomain(url) {
-    if (!url) return null;
-    if (url.startsWith('file:')) return 'Local File';
-    if (url.startsWith('chrome') || url.startsWith('edge') || url.startsWith('about') || url.startsWith('extension')) return null;
-
-    let domain = url.replace(/^(https?|ftp):\/\/(www\.)?/, '');
-    domain = domain.split('/')[0];
-    domain = domain.split(':')[0];
-    return domain.toLowerCase();
-}
-
-function getSiteSettingsKey(siteSettings, domain) {
-    if (!siteSettings || !domain) return null;
-    if (siteSettings[domain]) return domain;
-
-    return Object.keys(siteSettings)
-        .filter(savedDomain => domainMatchesSaved(domain, savedDomain))
-        .sort((a, b) => b.length - a.length)[0] || null;
-}
-
-function normalizeSavedDomain(value) {
-    if (!value) return "";
-    let domain = String(value).trim().toLowerCase();
-    domain = domain.replace(/^(https?|ftp):\/\/(www\.)?/, '');
-    domain = domain.split('/')[0].split(':')[0];
-    return domain;
-}
-
-function domainMatchesSaved(domain, savedDomain) {
-    const saved = normalizeSavedDomain(savedDomain);
-    return Boolean(domain && saved && (domain === saved || domain.endsWith(`.${saved}`)));
+    return sharedExtractRootDomain(url, { nullForInvalid: true });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -282,21 +198,9 @@ async function toggleSitePermission(domain, shouldExclude, tabId) {
 } 
 
 function handleError(error) {
+  if (isHarmlessMessageError(error)) return;
   const msg = error.message || error;
-  if (typeof msg === 'string') {
-      if (msg.includes("Receiving end does not exist") ||
-          msg.includes("Could not establish connection") ||
-          msg.includes("message channel closed")
-      ) {
-          return;
-      }
-  }
   console.error(`Volume Control: Error: ${msg}`);
-}
-
-function formatValue(dB) {
-  const n = normalizeDb(dB);
-  return `${n >= 0 ? '+' : ''}${n} dB`;
 }
 
 function setDisplayedVolume(dB) {
@@ -305,9 +209,29 @@ function setDisplayedVolume(dB) {
   const text = cached.volumeText || document.querySelector("#volume-text");
 
   if (slider) slider.value = String(normalizedDb);
-  if (text) text.value = formatValue(normalizedDb);
+  if (text) text.value = formatDb(normalizedDb);
 
   return normalizedDb;
+}
+
+function applyMuteButtonState(muted) {
+  const btn = cached.muteBtn || document.querySelector("#mute-btn");
+  if (!btn) return;
+  const isMuted = Boolean(muted);
+  btn.classList.toggle("muted", isMuted);
+  btn.setAttribute("aria-pressed", String(isMuted));
+  const label = btn.querySelector(".mute-label");
+  if (label) label.textContent = isMuted ? "Unmute" : "Mute";
+  btn.title = isMuted ? "Unmute" : "Mute";
+
+  // Reflect muted state on the slider + popup container so users see why
+  // dragging the slider does not change audible volume.
+  const popupContent = document.querySelector("#popup-content");
+  if (popupContent) popupContent.classList.toggle("is-muted", isMuted);
+  const slider = cached.slider || document.querySelector("#volume-slider");
+  if (slider) {
+    slider.title = isMuted ? "Volume (muted) - click Unmute to hear audio" : "Alt+Shift+Up / Alt+Shift+Down / Alt+Shift+0";
+  }
 }
 
 function applyAudioControlState(state = {}) {
@@ -329,6 +253,11 @@ function applyAudioControlState(state = {}) {
     note.textContent = state.limitation || BOOST_LIMIT_NOTE;
     note.classList.toggle("hidden", !cached.boostLimited);
   }
+
+  // Keep the mute button in sync with the content script's actual state.
+  // This matters when a setVolume response carries a muted flag that was
+  // changed elsewhere (e.g. via the hotkey while the popup was open).
+  if (state.muted !== undefined) applyMuteButtonState(state.muted);
 }
 
 async function refreshAudioControlState(tab) {
@@ -341,6 +270,7 @@ async function refreshAudioControlState(tab) {
         applyAudioControlState(state);
         if (state.volume !== undefined) setDisplayedVolume(state.volume);
         if (state.mono !== undefined && cached.monoCheckbox) cached.monoCheckbox.checked = Boolean(state.mono);
+        if (state.muted !== undefined) applyMuteButtonState(state.muted);
     }
 
     return state;
@@ -356,23 +286,26 @@ async function saveSiteSettings(tab) {
 
         const volumeSlider = cached.slider || document.getElementById("volume-slider");
         const monoCheckbox = cached.monoCheckbox || document.getElementById("mono-checkbox");
+        const muteBtn = cached.muteBtn || document.getElementById("mute-btn");
 
         const data = await storageGet({ siteSettings: {} });
         data.siteSettings = data.siteSettings || {};
         const settingsKey = getSiteSettingsKey(data.siteSettings, domain) || domain;
         data.siteSettings[settingsKey] = {
             volume: normalizeControlDb(volumeSlider?.value),
-            mono: Boolean(monoCheckbox?.checked)
+            mono: Boolean(monoCheckbox?.checked),
+            muted: Boolean(muteBtn && muteBtn.classList.contains("muted"))
         };
         await storageSet({ siteSettings: data.siteSettings });
 
-        // Notify the content script in this tab immediately so volume/mono are applied without waiting
+        // Notify the content script in this tab immediately so volume/mono/mute are applied without waiting
         if (tab && tab.id) {
             try {
                 tabsSendMessage(tab.id, { command: "setVolume", dB: data.siteSettings[settingsKey].volume }).catch(() => {
                     // It's possible the content script hasn't injected into the page yet; ignore harmless errors.
                 });
                 tabsSendMessage(tab.id, { command: "setMono", mono: Boolean(data.siteSettings[settingsKey].mono) }).catch(() => {});
+                tabsSendMessage(tab.id, { command: "setMute", muted: Boolean(data.siteSettings[settingsKey].muted) }).catch(() => {});
             } catch (e) {
                 // ignore messaging errors
             }
@@ -399,10 +332,14 @@ async function setVolume(dB, tab, options = {}) {
       }
 
       if (options.showFeedback !== false) {
+          const muted = (response && response.response && response.response.muted !== undefined)
+              ? Boolean(response.response.muted)
+              : Boolean(cached.muteBtn && cached.muteBtn.classList.contains("muted"));
           runtimeSendMessage({
               command: "showNativeVolumeFeedback",
               tabId: tab.id,
-              dB: normalizedDb
+              dB: normalizedDb,
+              muted
           }).catch(() => {});
       }
       await saveSiteSettings(tab);
@@ -415,6 +352,21 @@ async function toggleMono(tab) {
       tabsSendMessage(tab.id, { command: "setMono", mono: monoCheckbox.checked }).catch(handleError);
       await saveSiteSettings(tab);
   }
+}
+
+async function toggleMute(tab, muted) {
+  if (!tab) return;
+  applyMuteButtonState(muted);
+  const response = await tabsSendMessage(tab.id, { command: "setMute", muted }).catch(handleError);
+  // Update the browser-action badge immediately so the icon reflects mute state.
+  const dB = Number(cached.slider && cached.slider.value) || 0;
+  runtimeSendMessage({
+      command: "showNativeVolumeFeedback",
+      tabId: tab.id,
+      dB,
+      muted
+  }).catch(() => {});
+  await saveSiteSettings(tab);
 }
 
 async function toggleRemember(tab) {
@@ -442,6 +394,7 @@ function showError(error) {
   const popupContent = document.querySelector("#popup-content");
   const errorContent = document.querySelector("#error-content");
   const exclusionMessage = document.querySelector(".exclusion-message");
+  const settingsBtn = document.querySelector("#settings");
   
   if (popupContent) popupContent.classList.add("hidden");
   if (errorContent) errorContent.classList.add("hidden");
@@ -449,17 +402,39 @@ function showError(error) {
 
   if (error.type === "exclusion") {
     if (popupContent) popupContent.classList.remove("hidden");
-    if (exclusionMessage) exclusionMessage.classList.remove("hidden");
+    if (exclusionMessage) {
+        exclusionMessage.classList.remove("hidden");
+        // Make the exclusion message a live region so screen readers announce it,
+        // and make it focusable so we can move focus to it.
+        exclusionMessage.setAttribute("role", "alert");
+        exclusionMessage.setAttribute("tabindex", "-1");
+    }
     
     const top = document.querySelector(".top-controls");
     const left = document.querySelector(".left");
     if(top) top.classList.add("hidden");
     if(left) left.classList.add("hidden"); 
     document.body.classList.add("excluded-site");
+    
+    // Move focus to the settings button (still visible) so keyboard users have
+    // an actionable element. Fall back to the exclusion message if the button
+    // is hidden.
+    if (settingsBtn && settingsBtn.offsetParent !== null) {
+        settingsBtn.focus();
+    } else if (exclusionMessage) {
+        exclusionMessage.focus();
+    }
   } else {
     if (errorContent) {
         errorContent.classList.remove("hidden");
-        errorContent.querySelector("p").textContent = error.message || "An error occurred";
+        const errorParagraph = errorContent.querySelector("p");
+        if (errorParagraph) {
+            errorParagraph.textContent = error.message || "An error occurred";
+            // Announce the error to assistive technology.
+            errorParagraph.setAttribute("role", "alert");
+            errorParagraph.setAttribute("tabindex", "-1");
+            errorParagraph.focus();
+        }
     }
   }
 }
@@ -479,12 +454,43 @@ async function initializeControls(tab) {
     cached.monoCheckbox = monoCheckbox;
     cached.rememberCheckbox = rememberCheckbox;
 
+    const muteBtn = document.querySelector("#mute-btn");
+    cached.muteBtn = muteBtn;
+    if (muteBtn) {
+        muteBtn.addEventListener("click", () => {
+            const nextMuted = !muteBtn.classList.contains("muted");
+            toggleMute(tab, nextMuted);
+        });
+    }
+
     applyAudioControlState({ maxDb: MAX_DB, boostLimited: false, limitation: "" });
 
     if (volumeSlider) {
+      // Debounce the storage write and background feedback so rapid slider
+      // dragging doesn't flood the content script with messages and trigger
+      // excessive storage.local.set calls. The UI updates immediately; only
+      // the downstream side effects are debounced.
+      let volumeCommitTimer = null;
+      let lastCommittedDb = null;
+      const commitVolume = (dB) => {
+          if (volumeCommitTimer) clearTimeout(volumeCommitTimer);
+          lastCommittedDb = dB;
+          volumeCommitTimer = setTimeout(() => {
+              volumeCommitTimer = null;
+              setVolume(lastCommittedDb, tab);
+          }, 40);
+      };
       volumeSlider.addEventListener("input", () => {
           const normalizedDb = setDisplayedVolume(volumeSlider.value);
-          setVolume(normalizedDb, tab);
+          commitVolume(normalizedDb);
+      });
+      // Commit immediately when the user releases the slider.
+      volumeSlider.addEventListener("change", () => {
+          if (volumeCommitTimer) {
+              clearTimeout(volumeCommitTimer);
+              volumeCommitTimer = null;
+          }
+          setVolume(setDisplayedVolume(volumeSlider.value), tab);
       });
     }
     
@@ -509,8 +515,10 @@ async function initializeControls(tab) {
         if (saved) {
             if (rememberCheckbox) rememberCheckbox.checked = true;
             if (saved.mono !== undefined && monoCheckbox) monoCheckbox.checked = saved.mono;
+            if (saved.muted !== undefined) applyMuteButtonState(saved.muted);
             if (saved.volume !== undefined) await setVolume(saved.volume, tab, { showFeedback: false });
             tabsSendMessage(tab.id, { command: "setMono", mono: Boolean(saved.mono) }).catch(handleError);
+            tabsSendMessage(tab.id, { command: "setMute", muted: Boolean(saved.muted) }).catch(handleError);
         } else if (!audioState) {
             tabsSendMessage(tab.id, { command: "getVolume" }).then((response) => {
                 if (response && response.response !== undefined) setVolume(response.response, null);
@@ -519,6 +527,9 @@ async function initializeControls(tab) {
                 if (response && response.response !== undefined && monoCheckbox) {
                     monoCheckbox.checked = response.response;
                 }
+            }).catch(handleError);
+            tabsSendMessage(tab.id, { command: "getMute" }).then((response) => {
+                if (response && response.response !== undefined) applyMuteButtonState(response.response);
             }).catch(handleError);
         }
     } catch (e) {
