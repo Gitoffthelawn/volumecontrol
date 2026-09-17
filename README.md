@@ -14,7 +14,7 @@ Volume Control adds a simple per-site volume control to your browser. It can low
 
 Settings can be remembered per site, and you can exclude sites where you do not want the extension to run. Volume Control supports HTML5 video and audio only; it does not support Flash.
 
-Excluded-site entries match by domain, and entries saved **with a path** (such as the legacy V4-era defaults) are wildcard-matched against the full URL — so `www.twitch.tv/*/clip/*` excludes only the clip pages while the rest of Twitch runs. A one-time v6.13 migration removes the legacy Twitch default entries that older builds left in users' stored storage (path and `www.` normalization had turned them into a block on the whole domain — issue #69), and the popup's Active toggle now removes **every** entry that blocks the current page — not just the exact domain match — with a tooltip explaining what it removed. Since v6.14 the **options page also accepts user-typed paths**, so path-scoped exclusions are a first-class feature (`example.com/videos`, wildcards with `*` = any characters except `/` — see the options-page hint); the legacy purge now also runs at install/update/startup so a hand-added path entry can never be swept by a migration that has not run yet.
+Excluded-site entries match by domain, and entries saved **with a path** (such as the legacy V4-era defaults) are wildcard-matched against the full URL — so `www.twitch.tv/*/clip/*` excludes only the clip pages while the rest of Twitch runs. A one-time v6.13 migration removes the legacy Twitch default entries that older builds left in users' stored storage (path and `www.` normalization had turned them into a block on the whole domain — issue #69), and the popup's Active toggle now removes **every** entry that blocks the current page — not just the exact domain match — with a tooltip explaining what it removed. Since v6.14 the **options page also accepts user-typed paths**, so path-scoped exclusions are a first-class feature (`example.com/videos`, wildcards with `*` = any characters except `/` — see the options-page hint); the legacy purge now also runs at install/update/startup so a hand-added path entry can never be swept by a migration that has not run yet. Since v6.15 the popup **tells you when the current page is blocklisted** — an overlay message (styled like the DRM note) names the matching entry and how to re-enable the site, on every engine — and the options-page blocklist input accepts **Enter** to add an entry, with an inline notice when the typed site/wildcard is already in the list.
 
 **Compatibility:** Firefox 128+ (event-page background) and Chromium 121+ — Chrome, Edge, Brave, Opera, Vivaldi from January 2024 onward (service-worker background). Chromium 120 and older rejects the cross-browser manifest shape at load time, so the manifest declares `minimum_chrome_version: "121"`.
 
@@ -54,12 +54,49 @@ Some media cannot be routed through WebAudio, and whether that applies depends o
 
 ## Known Limitations
 
+- **Release builds must be produced with the fixed pipeline** — see the new **Release Builds** section below. Releases built with the pre-6.16 `build.ps1` from v6.13–v6.15 sources ship a `shared.js` SyntaxError and are completely inert.
+
 - Volume Control cannot run on browser system pages such as `chrome://`, `edge://`, `about:`, extension pages, or other protected browser UI.
 - DRM-protected media on **Chromium browsers** (Chrome/Edge/Brave/Opera/Vivaldi) can only use the native volume fallback: lowering and mute work; boosting and mono do not (the browser silences WebAudio for protected audio). If Widevine is disabled on such a browser (Brave's default), DRM sites simply won't play anything — non-DRM audio is unaffected and boosts identically. On **Firefox**, DRM media is fully boostable since v6.12. See [Restricted Media](#restricted-media-drm--cross-origin).
 - Cross-origin media without CORS can only use the native volume fallback in every engine: lowering and mute work; boosting and mono do not.
 - Sites that create their own `createMediaElementSource` pipeline for the same element can end up double-attenuating when Volume Control also routes that element.
 - Media that becomes cross-origin-tainted *after* it was already routed cannot be un-tainted; routing continues with the gain that was already applied.
 - Sites with unusual, heavily customized, or late-changing WebAudio graphs may not be fully controllable in every playback path.
+
+## Release Builds (read this before packaging)
+
+`scripts/build.ps1` creates Chrome and Firefox folders and ZIPs in `dist/`. It
+minifies the packaged JavaScript with [Terser](https://terser.org/), generates each
+browser's manifest, and compresses the ZIP entries. Source files stay unchanged;
+HTML, CSS, icons, and the license are copied byte-for-byte.
+
+The old regex-based comment stripper could mistake parts of JavaScript regex
+literals for comments, producing a **SyntaxError** that prevented the extension
+from starting. It could also change template-literal whitespace and corrupt UTF-8
+text on Windows PowerShell. Terser parses JavaScript correctly and reads/writes
+UTF-8 explicitly. The build removes comments and unnecessary whitespace, with
+compression rewrites and name mangling disabled to preserve cross-script names.
+
+Install Node.js 18 or newer and PowerShell. From the repository root, install the
+pinned build dependencies once (and again when `package-lock.json` changes), then
+build and run the regression checks:
+
+```powershell
+npm ci
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
+npm test
+```
+
+Use `npm.cmd` if Windows PowerShell blocks `npm.ps1`. The build checks that Node,
+`scripts/minify.mjs`, and Terser are available before replacing an existing release,
+and stops if JavaScript cannot be minified.
+
+`scripts/fixtures/` holds sample JavaScript with regression cases; these files are
+test inputs and are not included in the extension. `scripts/test-build.mjs` builds
+both browser variants in a temporary directory and checks minification, original
+source preservation, JavaScript syntax, regexes, templates, Unicode, shared URL
+helpers, and build errors. Run it through `npm test` or directly with
+`node --test scripts/test-build.mjs`.
 
 ## Hotkeys
 
@@ -101,15 +138,35 @@ AMO/Chrome Web Store review note: the broad host access, early `document_start` 
 
 # Changelog
 
+## Changes since 6.11 (through 6.16)
+
+These updates improve Firefox media compatibility, restore volume after track changes, add path-based site exclusions, and fix release-build minification. See the [full source comparison](https://github.com/Chaython/volumecontrol/compare/V6.11...1b91cc94f1a27469334ef3b88a7f9e51780f59b3).
+
+---
+
+<details open>
+<summary><strong>Versions 6.15–6.16 – Patch Notes</strong></summary>
+
+The popup/options changes previously labeled 6.15 and the 6.16 build changes are included together in the 6.16 commit.
+
+- **Fixed broken release builds:** replaced regex-based comment stripping that could corrupt JavaScript and prevent the extension from starting. Terser now removes comments and unnecessary whitespace while preserving names, regex literals, template contents, and UTF-8 text.
+- **Clearer exclusion messages:** the popup identifies the blocklist entry disabling the current page and explains how to re-enable it. Whitelist exclusions explain that only remembered sites are controlled. Exclusion status is read directly from saved settings, so it also works when the content script cannot reply.
+- **Easier list editing:** press Enter to add a site or path in Settings. Duplicate blocklist entries and remembered sites show an inline notice and keep the typed text for editing.
+- **Safer build failures:** check for Node, the minifier helper, and Terser before replacing existing output. Invalid JavaScript stops packaging instead of producing a broken ZIP. Original source files stay unchanged.
+- **Added build regression checks:** `npm test` builds both browser variants and checks minification, script parsing, regex/template/Unicode behavior, URL and blocklist helpers, source preservation, and failure handling. Test fixtures and build tools are excluded from release packages.
+- **Build setup:** Node.js 18+ and `npm ci` are now required. `build.ps1` runs minification and packaging; `npm test` runs the regression checks separately.
+
+</details>
+
 ---
 
 <details>
 <summary><strong>Version 6.14 – Patch Notes</strong></summary>
 
-- Fixed   [HIGH] **Boost took ~3 seconds to kick in on EME-probed sites playing clear content** (follow-up to issue #70, user report: "working on plex now but can we reduce the time from 3 seconds to a couple hundred milliseconds?"): v6.13 replaced the false "restricted" verdict on probe-only pages (Plex) with a pending state that refused routing during a blind 3-second grace window — safe, but the first ~3 s of every video played un-boosted (and a mid-session boost while already playing re-opened the full window). The window is now replaced by a **decryption-proof gate**: routing is refused only until the element's `currentTime` actually advances. EME content cannot decode a single frame without MediaKeys attached, and every attachment path is visible to the extension (patched `setMediaKeys`/`webkitSetMediaKeys`, `element.mediaKeys`/`webkitKeys`, the `encrypted` event), so **progress + zero evidence ⇒ clear media ⇒ safe to route**. Progress is observed via a per-element `timeupdate` listener (~4 Hz in Chromium; 15–250 ms per spec) plus the 1 s sweep as a backup — clear MSE content now routes on the first advancing timeupdate (~250 ms of playback), and a mid-session boost routes at the next timeupdate after the boost. DRM-stalled media (playback blocked on a license — `currentTime` frozen while "playing") never produces proof and is never routed: the udio.com birth-window safety now rests on the physics of EME (no keys ⇒ no decode ⇒ no progress) instead of on a timer, so it cannot be raced. Constructing MediaKeys resets earned proof (keys are imminent — re-prove or present evidence), a source change (`emptied`) re-earns proof, and the content script's mirror gate syncs via a document-level reset counter (`vcEmeResetSeq`)
-- Added   [MED] **Path-scoped blocklist entries can now be created from the options page**: the exclusion input accepts an optional path (`example.com/videos`, wildcards with `*` matching any characters except `/`, e.g. `example.com/*/season/*`), normalized by a dedicated blocklist input handler (protocol/port/`www.` stripped, case-normalized, trailing `/` trimmed — pathless input canonicalizes exactly as before, and whitelist "remembered sites" input keeps normalizing to a bare domain because site settings are domain-keyed). The hint text on the options page documents the syntax. The one-time legacy-default purge now also runs at install/update/startup (background worker) — before the UI can add anything — so a user who re-adds a path entry like `twitch.tv/*/clip/*` can never have it swept by a v6.13 migration that has not run yet
-- Documented **Residual limitation** of the faster gate: an element that plays clear content and later switches to encrypted media on the same element mid-session may already be routed when the evidence lands (Chromium cannot un-capture an element — the verdict flips to "restricted" but the route remains). This exposure existed after the grace window in every prior version; v6.14 only routes clear content sooner. Real sites reload the source or the player on protection changes, which re-earns proof
-- Verified     `scenario-firefox-drm.js` extended to a 3-way A/B (v6.12.1 / v6.13 / v6.14, 9 phases × 3 sources = 27 cells, all green): the v6.13 column reproduces the reported delay (progress at t=250 ms still unrouted — blind window; mid-session boost unrouted 3 s), the v6.14 column routes on the first advancing timeupdate with +10 dB gain exactly 3.1623, stalled DRM never routes, evidence is sticky (progress after evidence cannot lift the restriction), `createMediaKeys` re-verification works, and the routed-then-evidence contract keeps the verdict honest. Full regression: scenarios A/B/D/E/F2/F3, udio, treblo, v11, trackchange, blocklist all green; fuzz clean (seeds 424242 × 1500, 777 × 800, 31337 × 800); the original earrape/stuck/storm/user-report repros still verify fixed. **Live browser A/B on the Plex pattern** (real playback, real `timeupdate` cadence, `createMediaElementSource` instrumented): v6.13 routes **3901 ms** after play starts; v6.14 routes **236 ms** — at audio onset, before the first recorded timeupdate — with route gain exactly 3.1623, no false restriction flag; live DRM checks: keys-before-play ordering → **zero** routing calls + restricted verdict, and the play-before-probe ordering behaves identically in v6.13 and v6.14 (pre-existing parity)
+- **Faster boosting on clear media:** replaced the fixed three-second routing delay on pages that probe DRM support with playback-progress checks. Clear media, such as Plex direct-play content, can be boosted once playback advances without DRM evidence.
+- **Path-based exclusions in Settings:** add entries such as `example.com/videos` or `example.com/videos/*`. A `*` matches characters within a path segment; entries without a path still block the domain and its subdomains.
+- **Earlier legacy cleanup:** remove obsolete Twitch defaults during extension install/update, browser startup, and background initialization, in addition to the content-script migration.
+- **Recheck changing media:** reset playback-progress checks when a source changes or the page creates media keys, so a previous source's progress does not clear the new source for routing.
 
 </details>
 
@@ -118,12 +175,11 @@ AMO/Chrome Web Store review note: the broad host access, early `document_start` 
 <details>
 <summary><strong>Version 6.13 – Patch Notes</strong></summary>
 
-- Fixed   [HIGH] **Playlist track change reset the volume to the site's default for 1–10 s — or forever** (issue #71: "Volume resets to default every time new video in playlist loads, takes 1-10s to return" — YouTube playlist randomizer; Facebook reels replay): for attenuation-only state the hook applies the native fallback volume (`element.volume = base × min(gain, 1)`), and sites reset `element.volume` to their own default on track change/replay; a corrective write skipped by the 250 ms write-war guard was previously **dropped**, and with no further media event (event starvation) the site's loud default stuck — 1–10 s on YouTube (until the player's next event) or indefinitely on Facebook reels (until the user manually moved the slider). A skipped correction is now **scheduled** (deferred corrective write ~250 ms later), and a 1 s audit re-applies the fallback whenever a playing, unrouted, audible element's raw native volume has drifted from the expected scaled value. The write-war bound is preserved: at most one corrective write per 250 ms
-- Fixed   [HIGH] **Stopped working on desktop Firefox + Twitch** (issue #69): two stacked bugs. (1) V4-era builds seeded default blocklist entries WITH PATHS into users' stored storage (`"www.twitch.tv/*/clip/*"`, `"clips.twitch.tv"`) and never cleaned them; the matcher's normalization strips paths (and since 6.11 also `"www."`), so the legacy entry began matching the whole twitch.tv domain — deactivating the extension everywhere on Twitch. (2) The popup's Active toggle removed entries by exact indexOf(normalized domain), so the raw legacy entry could never be removed — toggling Active reloaded the page but stayed off. Fixed with path-aware blocklist matching (entries with a path are wildcard-matched against the full URL — clip pages stay blocked, the main site doesn't), a one-time migration that removes the legacy Twitch defaults from storage, and a popup Active toggle that removes EVERY entry blocking the current URL (with a tooltip explaining what it did); background, content script, and popup all use the same path-aware matcher
-- Fixed   [HIGH] **Netflix broken on Firefox** (issue #68): Gecko genuinely routes DRM audio through WebAudio (Mozilla bug 1331763, Firefox 55+ — only captureStream *video* is blocked), so DRM is boostable on Firefox — but v6.12.1 also allowed routing BEFORE the site attached MediaKeys, and Gecko's `setMediaKeys()` throws `NotSupportedError` on an already-audio-captured element, breaking the site's player (the reason the 6.12 "regression" commit existed). EME elements are now routed only AFTER `setMediaKeys()` succeeds (keys-attached marker; the patched `setMediaKeys` applies state on success), and engine detection checks the Firefox UA string FIRST (`navigator.userAgentData` second), so a future Firefox that grows a `userAgentData` shim is not misclassified
-- Fixed   [MED] **Boost wrongly clamped to 0 dB on app.plex.tv since 6.9** (issue #70: "Cannot boost volume after 6.11 on app.plex.tv" — the clamp itself dates to the v6.9 heuristic): the v6.9 "page granted EME access + `blob:` source" heuristic produced a permanent false "restricted" verdict on pages that merely PROBE DRM capability — app.plex.tv probes all three key systems at startup (verified in its production bundle) while playing clear direct-play content, so boost was clamped to 0 dB on ALL engines since v6.9. The "restricted" verdict now requires per-element DRM evidence (`encrypted` fired / `setMediaKeys` called / `element.mediaKeys` set) — probing alone never shows the note. ROUTING is still refused during a 3-second "pending" grace window on EME-probed pages for `blob:` sources without evidence (birth-window safety preserved from v6.9 — the clock restarts when the page actually creates MediaKeys), after which clear content routes normally: Plex boosts after ~3 s, and on Gecko Netflix routes immediately once keys attach
-- Kept     Cross-origin (no-CORS) media stays guarded on every engine (spec-mandated silence), and the udio.com birth-window safety is preserved — real DRM evidence within the 3 s window still means never routed + "restricted" verdict once the evidence lands
-- Verified     Three new automated A/B harness scenarios against the previous sources plus the full regression suite: `scenario-firefox-drm.js` (Gecko birth-window flow: v6.12.1 throws `NotSupportedError` from the site's `setMediaKeys` — site broken; v6.13 does not throw and routes with correct gain after keys attach. Plex probe pattern: v6.12.1 showed the false "restricted" verdict — `boostLimited=true`, never routed; v6.13 shows no note and routes after the grace window. udio.com birth-window safety passes on both), `scenario-trackchange.js` (v6.12.1 stays at the site's 1.0 for 2 s+ of total event starvation; v6.13 corrects within ~250 ms deferred / ~1 s audit backstop, write-war bound preserved at ≤1 corrective write per 250 ms), `scenario-blocklist.js` (with the V4 legacy entries in storage the old sources block the whole twitch.tv domain and the Active toggle cannot recover; v6.13: path-aware matching, one-time migration, popup toggle removing every blocking entry) — and the full 16-scenario regression suite green, fuzz clean (seed 424242, 1,500 iterations)
+- **More reliable volume across track changes:** retry delayed native-volume corrections and periodically check for volume drift when sites reset their players, addressing playlist transitions and replayed clips.
+- **Fix Firefox DRM startup ordering:** wait for media keys to attach before routing protected audio, addressing player failures caused by capturing audio too early. Firefox identification also takes priority over Chromium-style capability hints.
+- **Reduce false DRM restrictions:** checking whether the browser supports DRM no longer automatically clamps clear media to 0 dB or displays a restriction warning. The restriction verdict now requires evidence from the media element.
+- **Fix legacy Twitch exclusions:** match stored path entries against their paths instead of blocking the entire domain, and remove obsolete default Twitch entries in a one-time migration.
+- **Make the Active switch recover excluded pages:** enabling the extension removes every blocklist entry matching the current URL before reloading, including legacy and wildcard entries.
 
 </details>
 
@@ -132,9 +188,7 @@ AMO/Chrome Web Store review note: the broad host access, early `document_start` 
 <details>
 <summary><strong>Version 6.12.2 – Patch Notes</strong></summary>
 
-- Fixed   [HIGH] **"Load unpacked" failed on Chromium 120 and older with `'background.scripts' requires manifest version of 2 or lower.`** — the error appears exactly when the dual-key background introduced in 6.12.1 is loaded into a Chromium that predates 121 (or a validator applying pre-121 rules). The key combination itself is correct and stays: it is the **only** single-manifest form that works on both engines. What changed: the manifest now declares **`minimum_chrome_version: "121"`**, so store installs on older Chromium fail with a clear version message instead of a cryptic manifest error, and the floor is documented instead of implicit
-- Verified     **Empirical background-key compatibility matrix — every cell live-tested** (`analysis/harness/manifest-chrome-load.mjs` + `manifest-unpacked-cdp.mjs`, real Chrome for Testing 120 / 121 / 152): Chrome 120 rejects *any* MV3 manifest containing `background.scripts` (fatal, extension never registers); **Chrome 121+ accepts the dual-key and runs the service worker from `service_worker`, ignoring `scripts`** (verified on 121 and 152 via both the startup `--load-extension` path and the `Extensions.loadUnpacked` CDP path — the exact code behind the chrome://extensions "Load unpacked" button; background worker starts and registers in both); **`scripts`-only is silently broken on all Chromium** — the extension installs but gets *no background at all* (no hotkeys, no badge; zero service-worker registrations on 152), so it must never be used as a "cross-browser" form; Firefox 128+ runs the event page from `scripts` and ignores `service_worker` (live-verified in 6.12.1); Firefox rejects `service_worker`-only at install time. Conclusion: dual-key + the Chrome 121 floor is the only correct cross-browser answer
-- Verified     **Firefox 155 regression on the packaged 6.12.2 zip** (temporary add-on via WebDriver): installs cleanly with `minimum_chrome_version` present (Firefox ignores the key — no warnings in the install log), both content-script worlds run, engine detection returns Gecko, and a driven +20 dB boost routed a real element with route gain exactly 10.0 (mono gains 0.5/0.5), bridge restriction events flowing
+- **Declare Chromium 121 as the minimum version:** make the compatibility requirement for the shared source manifest explicit. Firefox's minimum remains 128.
 
 </details>
 
@@ -143,11 +197,10 @@ AMO/Chrome Web Store review note: the broad host access, early `document_start` 
 <details>
 <summary><strong>Version 6.12.1 – Patch Notes</strong></summary>
 
-- Fixed   [HIGH] **The extension could not be installed on Firefox at all**: the manifest declared only `background.service_worker`, which Firefox rejects at install time ("background.service_worker is currently disabled. Add background.scripts."). v6.12's Firefox DRM-boost feature was therefore unreachable as a packaged add-on (all prior Firefox verification had injected the hook as a page script, which bypasses the manifest). The background now uses the standard dual-key form — `service_worker` for Chrome + `scripts` for Firefox's event page — verified live by installing the packaged zip as a temporary add-on in real Firefox 155
-- Fixed   [MED] The content script's fallback path force-unmuted elements the **site** had muted (muted autoplay ads, site mute buttons) whenever volume attenuation was active; only a native mute the extension itself applied is ever toggled now (tracked via `data-vc-native-muted`)
-- Fixed   [LOW] Fallback native-volume writes while an element is paused were not rate-limited, so a site volume manager answering every `volumechange` could re-ignite the v6.11 write war during pause; the paused branch now uses the same 250 ms floor
-- Fixed   [LOW] The fallback hook path cleared `element.style.border` unconditionally in non-debug mode, wiping inline borders the site styled its player with; only borders the extension painted (debug mode) are ever removed
-- Verified     **The packaged extension installs and works on real Firefox 155** (temporary add-on via WebDriver): both content-script worlds run (MAIN hook marker + `vc-init`), engine detection returns Gecko, and a driven +20 dB boost routed a real element through WebAudio with route gain exactly 10.0. A probe add-on replicating the exact background pattern proved the event-page path (`importScripts` absent, `shared.js` loaded via the `scripts` array, shared globals visible). Chrome keeps using the service worker (the dual-key background is the documented cross-browser recipe; Chrome **121+** ignores the `scripts` key — Chrome 120 and older rejects the manifest, see 6.12.2 for the live-tested version matrix and the 121 floor). Full regression: scenarios A/B/D/E/F2/F3/treblo/udio/v11/v12/v13 + fuzz (single-world 2,000 iterations + 8 dual-world seeds) all clean
+- **Fix Firefox loading from the source folder:** declare Firefox background scripts alongside Chromium's service worker, with `shared.js` loaded before `background.js`.
+- **Respect site-controlled mute:** fallback volume handling only clears a native mute applied by the extension, rather than unmuting media the site had muted.
+- **Limit repeated volume writes while paused:** apply the same rate limit used during playback when a site's volume manager keeps changing the native volume.
+- **Preserve player borders:** normal audio-hook setup no longer clears a site's inline border when extension debugging is off.
 
 </details>
 
@@ -156,12 +209,8 @@ AMO/Chrome Web Store review note: the broad host access, early `document_start` 
 <details>
 <summary><strong>Version 6.12 – Patch Notes</strong></summary>
 
-- New   **DRM audio boosting on Firefox**: Mozilla explicitly allows capturing EME media audio through WebAudio (bug 1331763, Firefox 55+ — only video capture is blocked), so Volume Control now detects the engine and routes DRM media normally on Firefox. Boost, mono, and mute work on Netflix, Spotify web, and other Widevine/PlayReady sites in Firefox — matching what simpler competitor boosters have shipped for years
-- Fixed   The DRM guard was over-conservative on Firefox: DRM media was refused routing and the slider clamped at 0 dB even though Firefox plays routed EME audio normally (the "why does the other booster work on Netflix" report)
-- Kept     Chromium-family browsers (Chrome, Edge, Brave, Opera, Vivaldi) keep the full guard: routing an element with MediaKeys feeds the graph silence there (verified live: 0.00 RMS through a +20 dB route on a keys-attached element vs 3.53 RMS on the same route without keys) — refusal + native fallback remains the correct behavior
-- Kept     Cross-origin (no-CORS) media stays guarded on every engine — the WebAudio spec silences routed tainted media in all browsers, Firefox included
-- Improved     Engine detection is conservative: `navigator.userAgentData` proves Chromium; a `Firefox/` UA proves Gecko; unknown or privacy-stripped UAs keep the restricted verdict (never relax on doubt)
-- Verified     **Live on a real Firefox 155.0.1** (headless WebDriver run with a locally installed real Widevine 4.10.3112.0 CDM): engine detection returns Gecko; an MSE-backed element with genuine Widevine MediaKeys attached is routed and **audible** through WebAudio (2.13 RMS at +20 dB, route gain exactly 10.0) while the identical keys-attached setup on Chromium measures 0.00 RMS; same-origin boost (3.54 RMS) and WebAudio insertion (exact gain math) match Chromium, and cross-origin media stayed refused in the same run. A Widevine-disabled Chromium run (Brave-style) confirmed clear-media boost is identical (3.54 RMS) with no false restriction verdict, while a granted CDM (ClearKey attached before playback) still refuses routing. **PlayReady parity** additionally verified (deterministic scenario v13 + a live Firefox run with a PlayReady-shaped `com.microsoft.playready.recommendation.3000` grant: routed, audible at 3.54 RMS, unrestricted verdict; rejected probes never flag the page — Firefox's own `com.microsoft.playready.recommendation.3000` console warning is informational browser output aimed at site developers, not an extension error)
+- **Enable Firefox DRM audio controls:** allow boosting and mono processing for protected audio on Firefox instead of applying Chromium's DRM restriction to every browser.
+- **Keep browser-specific safeguards:** Chromium and unidentified engines continue to use native volume fallback for protected media. Cross-origin media without the required CORS access remains restricted on all engines.
 
 </details>
 
