@@ -12,7 +12,7 @@
 
 Volume Control adds a simple per-site volume control to your browser. It can lower volume, boost HTML5 audio and video above the normal browser limit, and optionally play stereo audio as mono. The extension is useful for quiet videos, uneven site volume, embedded players, and pages that do not provide enough audio control on their own.
 
-Settings can be remembered per site, and you can exclude sites where you do not want the extension to run. Volume Control supports HTML5 video and audio only; it does not support Flash.
+Settings can be remembered per site or URL path, including volume, mono, mute, and optional debug overrides; you can also exclude sites where you do not want the extension to run. Volume Control supports HTML5 video and audio only; it does not support Flash.
 
 Excluded-site entries match by domain, and entries saved **with a path** (such as the legacy V4-era defaults) are wildcard-matched against the full URL — so `www.twitch.tv/*/clip/*` excludes only the clip pages while the rest of Twitch runs. A one-time v6.13 migration removes the legacy Twitch default entries that older builds left in users' stored storage (path and `www.` normalization had turned them into a block on the whole domain — issue #69), and the popup's Active toggle now removes **every** entry that blocks the current page — not just the exact domain match — with a tooltip explaining what it removed. Since v6.14 the **options page also accepts user-typed paths**, so path-scoped exclusions are a first-class feature (`example.com/videos`, wildcards with `*` = any characters except `/` — see the options-page hint); the legacy purge now also runs at install/update/startup so a hand-added path entry can never be swept by a migration that has not run yet. Since v6.15 the popup **tells you when the current page is blocklisted** — an overlay message (styled like the DRM note) names the matching entry and how to re-enable the site, on every engine — and the options-page blocklist input accepts **Enter** to add an entry, with an inline notice when the typed site/wildcard is already in the list.
 
@@ -138,16 +138,64 @@ AMO/Chrome Web Store review note: the broad host access, early `document_start` 
 
 # Changelog
 
-## Changes since 6.11 (through 6.16)
+## Changes since 6.11 (through 6.23)
 
-These updates improve Firefox media compatibility, restore volume after track changes, add path-based site exclusions, and fix release-build minification. See the [full source comparison](https://github.com/Chaython/volumecontrol/compare/V6.11...1b91cc94f1a27469334ef3b88a7f9e51780f59b3).
+These updates improve Firefox media compatibility, restore volume after track changes, add path-based site exclusions and per-site debug profiles, and harden release-build minification. See the [full source comparison](https://github.com/Chaython/volumecontrol/compare/V6.11...master).
 
 ---
 
 <details open>
-<summary><strong>Versions 6.15–6.16 – Patch Notes</strong></summary>
+<summary><strong>Version 6.23 – Patch Notes</strong></summary>
 
-The popup/options changes previously labeled 6.15 and the 6.16 build changes are included together in the 6.16 commit.
+- **Capture WebRTC/MediaStream call audio:** media assigned through `HTMLMediaElement.srcObject` is now claimed immediately, including streams whose audio tracks are added later. This covers call paths used by sites such as Snapchat Web that do not use a normal URL-backed media source.
+- **MediaStream WebAudio fallback:** when a browser rejects `createMediaElementSource()` for a stream-backed call element, Volume Control can fall back to `createMediaStreamSource()` and silence the element's native duplicate while the extension graph is active. The fallback intentionally avoids the "element already owns a MediaElementSource" case so page-owned WebAudio graphs are not doubled.
+- **Immediate call/native fallback attenuation:** assigning a WebRTC `srcObject`, starting playback, browser volume resets, and source boundaries reapply attenuation immediately rather than waiting behind the normal anti-write-war throttle.
+- **Fix playlist transition spikes:** browser/source-transition corrections can bypass the 250 ms fallback write throttle, closing the short full-volume window reported during auto-next/replay while preserving throttling for ordinary audits.
+- **Live SPA path profiles:** `pushState`, `replaceState`, `popstate`, hash changes, and browser tab URL updates now trigger remembered/debug/whitelist/blocklist re-resolution in every frame. Path profiles no longer require a full reload on YouTube/Netflix/Plex-style navigation.
+- **Prevent stale async profile state:** content-script profile refreshes use a generation token so an older storage/top-URL lookup cannot finish late and overwrite newer navigation/settings state.
+- **Correct blocklist path semantics:** host names remain case-insensitive, URL paths preserve case, query strings/fragments are discarded, and a non-wildcard directory entry such as `example.com/videos` applies to that path and descendants.
+- **Deterministic remembered-profile precedence:** matching profiles now rank path scope, exact host, literal path specificity, wildcard count, and domain specificity instead of relying only on key-string length.
+- **Reduce remembered-setting lost updates:** options-page edits are serialized and re-read the latest storage before mutation; popup remembered writes are serialized as well.
+- **Release version:** bump the extension from 6.22 to 6.23.
+
+</details>
+
+---
+
+<details>
+<summary><strong>Version 6.22 – Patch Notes</strong></summary>
+
+- **True URL/path remembered profiles:** remembered settings and whitelist entries may now use paths such as `example.com/videos`; a path applies to itself and descendants, and `*` can match within a path segment. Existing domain-only settings remain backward compatible.
+- **Embedded-player profile consistency:** content scripts in cross-origin iframes now resolve remembered volume, mono, mute, whitelist state, and debug overrides against the top-level tab URL via the background service. CDN/player frames no longer silently use a different profile from the page the user remembered.
+- **Preserve per-site debug settings from hotkeys:** keyboard volume/mono/mute updates merge into the current remembered record instead of replacing it, so the nested per-site debug profile survives hotkey use.
+- **Fix local-file memory:** all contexts now use the canonical `file` key, while still recognizing the legacy `Local File` key.
+- **Harden release output deletion:** `build.ps1` explicitly rejects the repository root and sibling paths that merely share the repository-name prefix, preventing an unsafe `-OutputDir .` from recursively deleting the checkout.
+- **Add CI:** Windows GitHub Actions now runs `npm ci`, the regression suite, a full Firefox/Chrome package build, and uploads the generated ZIPs on pushes, pull requests, and manual runs.
+- **Expand regression coverage:** tests now cover URL/path profile precedence, wildcard matching, local-file compatibility, iframe top-URL inheritance, hotkey profile preservation, and dangerous build-output paths.
+- **Release version:** bump the extension from 6.21 to 6.22.
+
+</details>
+
+---
+
+<details>
+<summary><strong>Version 6.21 – Patch Notes</strong></summary>
+
+- **Remember debug options per site:** remembered-site profiles can now store Debug Highlight, Force DRM Audio Capture, Skip CORS Media Guard, and HTML Media Route Override. With **Site debug** disabled, a remembered site continues to inherit the global debug defaults.
+- **Preserve per-site debug profiles:** popup volume/mono/mute saves keep the optional debug object instead of replacing the remembered record.
+- **Minify CSS release assets:** packaged `.css` files are optimized with pinned `clean-css 5.3.3` level-1 optimization, with URL rebasing disabled.
+- **Minify HTML release assets:** packaged `.html` files are minified with pinned `html-minifier-terser 7.2.0` using conservative whitespace handling. Inline JavaScript/CSS minification stays disabled because standalone assets are handled by their dedicated minifiers.
+- **Expand build regression tests:** both browser packages must show smaller JS/CSS/HTML output while the source tree remains byte-for-byte unchanged; tests also verify important popup/options IDs, script references, CSS custom properties, and per-site debug styles survive minification.
+- **Release version:** bump the extension from 6.20 to 6.21.
+
+</details>
+
+---
+
+<details>
+<summary><strong>Versions 6.15–6.20 – Patch Notes</strong></summary>
+
+The 6.15–6.20 line covers exclusion UX, build hardening, debug routing controls, limiter consistency fixes, and mono-availability handling.
 
 - **Fixed broken release builds:** replaced regex-based comment stripping that could corrupt JavaScript and prevent the extension from starting. Terser now removes comments and unnecessary whitespace while preserving names, regex literals, template contents, and UTF-8 text.
 - **Clearer exclusion messages:** the popup identifies the blocklist entry disabling the current page and explains how to re-enable it. Whitelist exclusions explain that only remembered sites are controlled. Exclusion status is read directly from saved settings, so it also works when the content script cannot reply.
@@ -158,7 +206,7 @@ The popup/options changes previously labeled 6.15 and the 6.16 build changes are
 - **Add routing diagnostics:** Settings now also has a debug-only CORS bypass and an HTML-media route override (Automatic / Force WebAudio / Force native fallback). These are intentionally dangerous compatibility tools; CORS-bypassed WebAudio can output silence, and forced native fallback cannot boost or mono-process HTML media.
 - **Fix playlist transition volume spikes:** the page's own media volume is tracked separately from Volume Control's dB gain. Native attenuation is applied immediately when a site rewrites `video.volume`, while existing WebAudio routes remain associated with reused media elements across playlist transitions.
 - **Fix debug override limiter consistency (v6.19):** DRM and CORS debug overrides now apply at the final boost-limit verdict layer too, so stale fallback flags, MAIN-world aggregate restrictions, and iframe reports cannot keep the popup/slider clamped after the matching override is enabled. Force WebAudio remains a routing choice; DRM/CORS bypasses remain independent explicit safety overrides.
-- **Fix debug override limiter consistency (v6.19):** DRM and CORS debug overrides now apply at the final boost-limit verdict layer too, so stale fallback flags, MAIN-world aggregate restrictions, and iframe reports cannot keep the popup/slider clamped after the matching override is enabled. Force WebAudio remains a routing choice; DRM/CORS bypasses remain independent explicit safety overrides.
+- **Disable unavailable mono controls (v6.20):** the popup now disables and visually de-emphasizes Mono whenever the active route cannot provide WebAudio channel processing, including restricted/cross-origin fallback and forced-native debug routing.
 - **Build setup:** Node.js 18+ and `npm ci` are now required. `build.ps1` runs minification and packaging; `npm test` runs the regression checks separately.
 
 </details>
@@ -432,13 +480,20 @@ This is the minimum possible file count given the WebExtension API's security co
 
 ## Build packages
 
+Install the pinned build tools and run the regression suite before packaging:
+
+```powershell
+npm ci
+npm test
+```
+
 Create Firefox and Chrome zip packages:
 
 ```powershell
 .\scripts\build.ps1
 ```
 
-The script writes clean packages to `dist/`, using `ico.svg` for Firefox and `chrome.png` for Chrome. The bundled zips exclude repo files and `README.md`.
+The script writes clean packages to `dist/`, using `ico.svg` for Firefox and `chrome.png` for Chrome. Release copies are minified with **Terser 5.51.2** for JavaScript, **clean-css 5.3.3** for CSS, and **html-minifier-terser 7.2.0** for HTML. The source files are never rewritten by the build, and the bundled zips exclude repo files and `README.md`. `.github/workflows/ci.yml` runs the same regression/build path on Windows for pushes and pull requests and publishes the ZIPs as workflow artifacts.
 
 ***
 

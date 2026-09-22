@@ -5,6 +5,7 @@ const {
     getGainValue,
     storageGet,
     storageSet,
+    runtimeSendMessage,
     domainMatchesSaved,
     isUrlBlockedByEntries,
     purgeLegacyDefaultBlocklist,
@@ -25,6 +26,9 @@ const BOOST_LIMIT_NOTES = {
     "fallback": BOOST_LIMIT_NOTE
 };
 let pageBridgeResyncInterval = null;
+let controlProfileReady = false;
+let profileControlUrl = "";
+let startGeneration = 0;
 
 const tc = {
   settings: {
@@ -58,6 +62,13 @@ function log(msg, level = 4) {
 
 if (browserAPI) {
     browserAPI.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+        if (!msg) return;
+        if (msg.command === "profileUrlChanged") {
+            if (typeof msg.url === "string" && msg.url) profileControlUrl = msg.url;
+            start();
+            sendResponse({});
+            return;
+        }
         if (tc.vars.isBlocked) return;
         switch (msg.command) {
             case "checkExclusion":
@@ -540,7 +551,7 @@ window.addEventListener("message", handleFrameLimitReport);
 let lastPostedFrameReport = { reason: null, at: 0 };
 function reportFrameBoostLimit() {
     if (isTopFrame()) return;
-    if (tc.vars.isBlocked) return;
+    if (!controlProfileReady || tc.vars.isBlocked) return;
     try {
         const limit = getBoostLimitInfo();
         const now = Date.now();
@@ -1253,14 +1264,84 @@ function initWhenReady() {
 }
 
 function extractRootDomain(url) {
-    return sharedExtractRootDomain(url, { fileValue: "file" });
-} 
+    return sharedExtractRootDomain(url);
+}
+
+async function resolveControlUrl() {
+    if (isTopFrame()) return window.location.href;
+    if (profileControlUrl) return profileControlUrl;
+
+    try {
+        const response = await runtimeSendMessage({ command: "getTopTabUrl" });
+        if (response && typeof response.url === "string" && response.url) {
+            return response.url;
+        }
+    } catch (e) {
+        if (tc.settings.debugMode) log(`top-tab URL lookup failed: ${e && e.message}`, 3);
+    }
+
+    // Fall back to the frame URL only if the background is temporarily
+    // unavailable. A later storage change/navigation will retry start().
+    return window.location.href;
+}
+
+function normalizeDebugRouteMode(value) {
+    return value === "webaudio" || value === "native" ? value : "auto";
+}
+
+function applyEffectiveDebugSettings(data, controlUrl) {
+    const previous = {
+        debugMode: tc.settings.debugMode,
+        forceDrmCapture: tc.settings.forceDrmCapture,
+        forceCorsCapture: tc.settings.forceCorsCapture,
+        debugRouteMode: tc.settings.debugRouteMode
+    };
+
+    // Global options remain the defaults for every site.
+    tc.settings.debugMode = !!data.debugMode;
+    tc.settings.forceDrmCapture = !!data.forceDrmCapture;
+    tc.settings.forceCorsCapture = !!data.forceCorsCapture;
+    tc.settings.debugRouteMode = normalizeDebugRouteMode(data.debugRouteMode);
+
+    // A remembered site's optional debug object overrides those defaults only
+    // for URLs matched by the existing whitelist/memory lookup.
+    const siteSettingsKey = getSiteSettingsKey(data.siteSettings || {}, controlUrl);
+    const siteSettings = siteSettingsKey ? data.siteSettings[siteSettingsKey] : null;
+    const siteDebug = siteSettings && siteSettings.debug && typeof siteSettings.debug === "object"
+        ? siteSettings.debug
+        : null;
+
+    if (siteDebug) {
+        if (siteDebug.debugMode !== undefined) tc.settings.debugMode = !!siteDebug.debugMode;
+        if (siteDebug.forceDrmCapture !== undefined) tc.settings.forceDrmCapture = !!siteDebug.forceDrmCapture;
+        if (siteDebug.forceCorsCapture !== undefined) tc.settings.forceCorsCapture = !!siteDebug.forceCorsCapture;
+        if (siteDebug.debugRouteMode !== undefined) {
+            tc.settings.debugRouteMode = normalizeDebugRouteMode(siteDebug.debugRouteMode);
+        }
+    }
+
+    const changed =
+        previous.debugMode !== tc.settings.debugMode ||
+        previous.forceDrmCapture !== tc.settings.forceDrmCapture ||
+        previous.forceCorsCapture !== tc.settings.forceCorsCapture ||
+        previous.debugRouteMode !== tc.settings.debugRouteMode;
+
+    if (changed) {
+        invalidateBoostLimitCache();
+        lastSyncedPageAudioState = null;
+    }
+
+    return siteSettingsKey;
+}
 
 async function start() {
     if (!browserAPI) return;
 
+    const generation = ++startGeneration;
+    controlProfileReady = false;
     try {
         const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {}, debugMode: false, forceDrmCapture: false, forceCorsCapture: false, debugRouteMode: "auto", legacyTwitchDefaultsPurged: false });
+        if (generation !== startGeneration) return;
 
         // One-time migration (issue #69): V4-era builds seeded default
         // blocklist entries with paths ("www.twitch.tv/*/clip/*",
@@ -1280,18 +1361,16 @@ async function start() {
             }
         }
 
-        if (data.debugMode !== undefined) tc.settings.debugMode = data.debugMode;
-        if (data.forceDrmCapture !== undefined) tc.settings.forceDrmCapture = !!data.forceDrmCapture;
-        if (data.forceCorsCapture !== undefined) tc.settings.forceCorsCapture = !!data.forceCorsCapture;
-        tc.settings.debugRouteMode = data.debugRouteMode === "webaudio" || data.debugRouteMode === "native"
-            ? data.debugRouteMode
-            : "auto";
-
-        const currentDomain = extractRootDomain(window.location.href);
+        if (generation !== startGeneration) return;
+        const controlUrl = await resolveControlUrl();
+        if (generation !== startGeneration) return;
+        if (!isTopFrame() && controlUrl) profileControlUrl = controlUrl;
+        const currentDomain = extractRootDomain(controlUrl);
+        const siteSettingsKey = applyEffectiveDebugSettings(data, controlUrl);
 
         // Debug: show state used to decide blocking
         if (tc.settings.debugMode) {
-            log(`start(): domain=${currentDomain} whitelistMode=${data.whitelistMode} fqdns=[${(data.fqdns||[]).slice(0,5).join(',')}] siteSettingsCount=${Object.keys(data.siteSettings||{}).length}`, 4);
+            log(`start(): controlUrl=${controlUrl} domain=${currentDomain} whitelistMode=${data.whitelistMode} fqdns=[${(data.fqdns||[]).slice(0,5).join(',')}] siteSettingsCount=${Object.keys(data.siteSettings||{}).length}`, 4);
         }
 
         let blocked = false;
@@ -1299,12 +1378,12 @@ async function start() {
             // Whitelist is derived from remembered sites (siteSettings)
             const remembered = Object.keys(data.siteSettings || {});
             if (tc.settings.debugMode) log(`start(): remembered samples=[${remembered.slice(0,5).join(',')}]`, 4);
-            if (!getSiteSettingsKey(data.siteSettings || {}, currentDomain)) blocked = true;
+            if (!siteSettingsKey) blocked = true;
         } else {
             // Path-aware matching (issue #69): legacy path entries like
             // "www.twitch.tv/*/clip/*" scope to their path and no longer
             // block the whole domain.
-            if (isUrlBlockedByEntries(window.location.href, data.fqdns || [])) blocked = true;
+            if (isUrlBlockedByEntries(controlUrl, data.fqdns || [])) blocked = true;
         }
 
         // Debug: log final decision
@@ -1312,6 +1391,8 @@ async function start() {
 
         // Ensure the content script's blocked flag reflects the current state (clear it when unblocked)
         tc.vars.isBlocked = blocked;
+        controlProfileReady = true;
+        if (!isTopFrame()) reportFrameBoostLimit();
         if (blocked) {
             applyState();
             ensurePageBridgeResync();
@@ -1319,7 +1400,6 @@ async function start() {
             return;
         }
 
-        const siteSettingsKey = getSiteSettingsKey(data.siteSettings, currentDomain);
         if (siteSettingsKey) {
             const s = data.siteSettings[siteSettingsKey];
             if (s.volume !== undefined) tc.vars.dB = normalizeDb(s.volume);
@@ -1350,6 +1430,15 @@ window.addEventListener("message", (event) => {
     const data = event.data;
     if (!data || data.source !== PAGE_BRIDGE_TARGET || data.target !== PAGE_BRIDGE_SOURCE) return;
 
+    if (data.command === "locationChanged") {
+        if (isTopFrame()) {
+            profileControlUrl = typeof data.href === "string" && data.href ? data.href : window.location.href;
+            start();
+            runtimeSendMessage({ command: "topUrlChanged", url: profileControlUrl }).catch(() => {});
+        }
+        return;
+    }
+
     // The hook's aggregate page restriction (covers detached/shadow-DOM media
     // the document scan cannot see) just appeared or cleared. Drop our cached
     // verdict so the next state query reflects it immediately.
@@ -1373,43 +1462,19 @@ if (browserAPI && browserAPI.storage && browserAPI.storage.onChanged) {
 
         if (tc.settings.debugMode) log(`onChanged: keys=[${Object.keys(changes).join(',')}]`, 4);
 
-        // Re-evaluate blocking and apply site settings in a single pass.
-        // Previously this called start() AND a separate siteSettings handler,
-        // causing double storage reads, double applyState() calls, and potential
-        // race conditions if the two reads completed in different orders.
-        if (changes.whitelistMode || changes.fqdns || changes.siteSettings) {
+        // Re-evaluate blocking, remembered audio state, and effective debug
+        // settings in one pass. This is important for per-site debug: a global
+        // change must not overwrite a remembered site's explicit override.
+        if (
+            changes.whitelistMode ||
+            changes.fqdns ||
+            changes.siteSettings ||
+            changes.debugMode ||
+            changes.forceDrmCapture ||
+            changes.forceCorsCapture ||
+            changes.debugRouteMode
+        ) {
             start();
-        }
-
-        // Update debug mode live
-        if (changes.debugMode) {
-            tc.settings.debugMode = !!changes.debugMode.newValue;
-            syncPageAudioHook();
-        }
-
-        // Dangerous debug overrides. They intentionally bypass safeguards or
-        // force a media routing strategy for troubleshooting.
-        if (changes.forceDrmCapture) {
-            tc.settings.forceDrmCapture = !!changes.forceDrmCapture.newValue;
-            invalidateBoostLimitCache();
-            lastSyncedPageAudioState = null;
-            syncPageAudioHook();
-            applyState();
-        }
-        if (changes.forceCorsCapture) {
-            tc.settings.forceCorsCapture = !!changes.forceCorsCapture.newValue;
-            invalidateBoostLimitCache();
-            lastSyncedPageAudioState = null;
-            syncPageAudioHook();
-            applyState();
-        }
-        if (changes.debugRouteMode) {
-            const mode = changes.debugRouteMode.newValue;
-            tc.settings.debugRouteMode = mode === "webaudio" || mode === "native" ? mode : "auto";
-            invalidateBoostLimitCache();
-            lastSyncedPageAudioState = null;
-            syncPageAudioHook();
-            applyState();
         }
     });
 }

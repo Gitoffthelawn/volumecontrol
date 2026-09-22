@@ -3,6 +3,7 @@ const {
   MIN_DB,
   MAX_DB,
   normalizeDb,
+  normalizeSiteSettingsEntryInput,
   formatDb,
   storageGet,
   storageSet,
@@ -22,6 +23,7 @@ const {
 } = globalThis.VolumeControlShared;
 const sharedExtractRootDomain = globalThis.VolumeControlShared.extractRootDomain;
 const WHEEL_STEP_DB = 1;  // volume change per wheel notch (matches hotkey step)
+let siteSettingsSaveChain = Promise.resolve();
 const cached = {
   slider: null,
   volumeText: null,
@@ -163,7 +165,7 @@ function handleTabs(tabs) {
             let isExcluded = false;
             let detail = null;
             if (data.whitelistMode) {
-                isExcluded = !getSiteSettingsKey(data.siteSettings || {}, domain);
+                isExcluded = !getSiteSettingsKey(data.siteSettings || {}, currentTab.url);
                 if (isExcluded) detail = exclusionOverlayDetail(data, currentTab.url);
             } else {
                 detail = exclusionOverlayDetail(data, currentTab.url);
@@ -200,7 +202,7 @@ async function updateEnableSwitch(tab) {
             // v6.15: a non-remembered site is just as inactive as a blocklisted
             // one — show the overlay explaining why (same verdict the content
             // script enforces).
-            if (!getSiteSettingsKey(data.siteSettings || {}, domain)) {
+            if (!getSiteSettingsKey(data.siteSettings || {}, tab.url)) {
                 showError({ type: "exclusion", detail: exclusionOverlayDetail(data, tab.url) });
             }
             return;
@@ -247,20 +249,22 @@ async function toggleSitePermission(domain, shouldExclude, tabId, tabUrl) {
             // Edit remembered sites instead of an arbitrary whitelist
             const sd = await storageGet({ siteSettings: {} });
             const settings = sd.siteSettings || {};
+            const settingsKey = getSiteSettingsKey(settings, tabUrl || domain);
+            const defaultKey = normalizeSiteSettingsEntryInput(tabUrl || domain) || domain;
             if (shouldExclude) {
-                if (settings[domain]) {
-                    delete settings[domain];
+                if (settingsKey) {
+                    delete settings[settingsKey];
                     await storageSet({ siteSettings: settings });
                 }
             } else {
-                if (!settings[domain]) {
-                    settings[domain] = { volume: 0, mono: false };
+                if (!settingsKey && defaultKey) {
+                    settings[defaultKey] = { volume: 0, mono: false, muted: false };
                     await storageSet({ siteSettings: settings });
                     // Try to apply settings immediately to the tab that requested the change
                     if (tabId) {
                         try {
-                            tabsSendMessage(tabId, { command: "setVolume", dB: settings[domain].volume }).catch(() => {});
-                            tabsSendMessage(tabId, { command: "setMono", mono: Boolean(settings[domain].mono) }).catch(() => {});
+                            tabsSendMessage(tabId, { command: "setVolume", dB: settings[defaultKey].volume }).catch(() => {});
+                            tabsSendMessage(tabId, { command: "setMono", mono: Boolean(settings[defaultKey].mono) }).catch(() => {});
                         } catch (e) { /* ignore */ }
                     }
                 }
@@ -412,13 +416,13 @@ async function pollAudioControlState(tab) {
     return state;
 }
 
-async function saveSiteSettings(tab) {
+async function saveSiteSettingsNow(tab) {
     try {
         const rememberCheckbox = document.getElementById("remember-checkbox");
         if (!rememberCheckbox || !rememberCheckbox.checked || !tab || !tab.url) return;
 
-        const domain = extractRootDomain(tab.url);
-        if (!domain) return;
+        const defaultSettingsKey = normalizeSiteSettingsEntryInput(tab.url);
+        if (!defaultSettingsKey) return;
 
         const volumeSlider = cached.slider || document.getElementById("volume-slider");
         const monoCheckbox = cached.monoCheckbox || document.getElementById("mono-checkbox");
@@ -426,8 +430,12 @@ async function saveSiteSettings(tab) {
 
         const data = await storageGet({ siteSettings: {} });
         data.siteSettings = data.siteSettings || {};
-        const settingsKey = getSiteSettingsKey(data.siteSettings, domain) || domain;
+        const settingsKey = getSiteSettingsKey(data.siteSettings, tab.url) || defaultSettingsKey;
+        // Preserve optional per-site debug overrides when the popup updates
+        // volume/mono/mute. Older code replaced the whole remembered record,
+        // which would silently erase the debug profile on every volume change.
         data.siteSettings[settingsKey] = {
+            ...(data.siteSettings[settingsKey] || {}),
             volume: normalizeControlDb(volumeSlider?.value),
             mono: Boolean(monoCheckbox?.checked),
             muted: Boolean(muteBtn && muteBtn.classList.contains("muted"))
@@ -449,7 +457,13 @@ async function saveSiteSettings(tab) {
     } catch (e) {
         handleError(e);
     }
-} 
+}
+
+function saveSiteSettings(tab) {
+    const run = () => saveSiteSettingsNow(tab);
+    siteSettingsSaveChain = siteSettingsSaveChain.then(run, run);
+    return siteSettingsSaveChain;
+}
 
 async function setVolume(dB, tab, options = {}) {
   let normalizedDb = setDisplayedVolume(dB);
@@ -526,14 +540,14 @@ async function toggleMute(tab, muted) {
 async function toggleRemember(tab) {
     try {
         const rememberCheckbox = document.getElementById("remember-checkbox");
-        const domain = extractRootDomain(tab.url);
-        if (!domain) return;
+        const defaultSettingsKey = normalizeSiteSettingsEntryInput(tab.url);
+        if (!defaultSettingsKey) return;
 
         if (rememberCheckbox && rememberCheckbox.checked) {
             await saveSiteSettings(tab);
         } else {
             const data = await storageGet({ siteSettings: {} });
-            const settingsKey = getSiteSettingsKey(data.siteSettings, domain);
+            const settingsKey = getSiteSettingsKey(data.siteSettings, tab.url);
             if (data.siteSettings && settingsKey) {
                 delete data.siteSettings[settingsKey];
                 await storageSet({ siteSettings: data.siteSettings });
@@ -703,7 +717,7 @@ async function initializeControls(tab) {
     try {
         const audioState = await refreshAudioControlState(tab);
         const data = await storageGet({ siteSettings: {} });
-        const settingsKey = getSiteSettingsKey(data.siteSettings || {}, domain);
+        const settingsKey = getSiteSettingsKey(data.siteSettings || {}, tab.url);
         const saved = settingsKey ? data.siteSettings[settingsKey] : null;
         if (saved) {
             if (rememberCheckbox) rememberCheckbox.checked = true;

@@ -2,6 +2,7 @@ const {
     browserApi,
     normalizeDb,
     normalizeDomainInput,
+    normalizeSiteSettingsEntryInput,
     normalizeBlocklistEntryInput,
     formatDb,
     storageGet,
@@ -13,8 +14,35 @@ const {
 let memoryListRenderTimeout = null;
 // debounce for fqdn list updates
 let fqdnListRenderTimeout = null;
+let siteSettingsWriteChain = Promise.resolve();
 
-function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
+function updateSiteSettings(mutator) {
+    const run = async () => {
+        const data = await storageGet({ siteSettings: {} });
+        const settings = { ...(data.siteSettings || {}) };
+        const result = await mutator(settings);
+        if (result === false) return false;
+        await storageSet({ siteSettings: settings });
+        return true;
+    };
+    siteSettingsWriteChain = siteSettingsWriteChain.then(run, run);
+    return siteSettingsWriteChain;
+}
+
+function normalizeDebugRouteMode(value) {
+    return value === 'webaudio' || value === 'native' ? value : 'auto';
+}
+
+function normalizeSiteDebugOverrides(value = {}) {
+    return {
+        debugMode: !!value.debugMode,
+        forceDrmCapture: !!value.forceDrmCapture,
+        forceCorsCapture: !!value.forceCorsCapture,
+        debugRouteMode: normalizeDebugRouteMode(value.debugRouteMode)
+    };
+}
+
+function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename, globalDebugSettings = {}) {
     const entry = document.createElement('div');
     entry.className = 'list-entry';
 
@@ -27,7 +55,7 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
 
     // Commit rename on blur or Enter
     const commitRename = async () => {
-        const newName = normalizeDomainInput(info.value);
+        const newName = normalizeSiteSettingsEntryInput(info.value);
         if (!newName) {
             alert('Site cannot be empty.');
             info.value = domain;
@@ -127,6 +155,110 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
 
     controls.appendChild(settingGroup);
 
+    // Optional per-site debug override. When disabled, this remembered site
+    // inherits the global debug defaults below. Enabling it snapshots the
+    // currently displayed effective values so behavior does not change just
+    // because the override was turned on.
+    const savedDebug = settings && settings.debug && typeof settings.debug === 'object'
+        ? normalizeSiteDebugOverrides(settings.debug)
+        : null;
+    const inheritedDebug = normalizeSiteDebugOverrides(globalDebugSettings);
+    const effectiveDebug = savedDebug || inheritedDebug;
+
+    const debugGroup = document.createElement('div');
+    debugGroup.className = 'setting-group site-debug-group';
+
+    const perSiteLabel = document.createElement('label');
+    perSiteLabel.className = 'mono-label site-debug-enable';
+    perSiteLabel.title = 'Override the global debug options for this remembered site';
+    const perSiteCheckbox = document.createElement('input');
+    perSiteCheckbox.type = 'checkbox';
+    perSiteCheckbox.checked = Boolean(savedDebug);
+    perSiteLabel.appendChild(perSiteCheckbox);
+    const perSiteText = document.createElement('span');
+    perSiteText.textContent = 'Site debug';
+    perSiteLabel.appendChild(perSiteText);
+    debugGroup.appendChild(perSiteLabel);
+
+    function makeDebugCheckbox(text, checked, title) {
+        const label = document.createElement('label');
+        label.className = 'mono-label site-debug-option';
+        label.title = title;
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = checked;
+        label.appendChild(checkbox);
+        const span = document.createElement('span');
+        span.textContent = text;
+        label.appendChild(span);
+        debugGroup.appendChild(label);
+        return checkbox;
+    }
+
+    const debugHighlightCheckbox = makeDebugCheckbox(
+        'Highlight',
+        effectiveDebug.debugMode,
+        'Show debug borders on media elements for this site'
+    );
+    const drmCheckbox = makeDebugCheckbox(
+        'DRM',
+        effectiveDebug.forceDrmCapture,
+        'Force DRM/EME audio capture for this site (dangerous)'
+    );
+    const corsCheckbox = makeDebugCheckbox(
+        'CORS',
+        effectiveDebug.forceCorsCapture,
+        'Skip the cross-origin media guard for this site (dangerous)'
+    );
+
+    const routeSelect = document.createElement('select');
+    routeSelect.className = 'site-debug-route';
+    routeSelect.title = 'HTML media route override for this site';
+    for (const [value, label] of [
+        ['auto', 'Route: Auto'],
+        ['webaudio', 'Route: WebAudio'],
+        ['native', 'Route: Native']
+    ]) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        routeSelect.appendChild(option);
+    }
+    routeSelect.value = effectiveDebug.debugRouteMode;
+    debugGroup.appendChild(routeSelect);
+
+    const debugInputs = [debugHighlightCheckbox, drmCheckbox, corsCheckbox, routeSelect];
+    const updateDebugEnabledState = () => {
+        for (const input of debugInputs) input.disabled = !perSiteCheckbox.checked;
+        debugGroup.classList.toggle('is-inherited', !perSiteCheckbox.checked);
+    };
+    const commitDebug = () => {
+        if (!perSiteCheckbox.checked) {
+            onUpdate(domain, { debug: null });
+            return;
+        }
+        onUpdate(domain, {
+            debug: normalizeSiteDebugOverrides({
+                debugMode: debugHighlightCheckbox.checked,
+                forceDrmCapture: drmCheckbox.checked,
+                forceCorsCapture: corsCheckbox.checked,
+                debugRouteMode: routeSelect.value
+            })
+        });
+    };
+
+    perSiteCheckbox.addEventListener('change', () => {
+        updateDebugEnabledState();
+        commitDebug();
+    });
+    debugHighlightCheckbox.addEventListener('change', commitDebug);
+    drmCheckbox.addEventListener('change', commitDebug);
+    corsCheckbox.addEventListener('change', commitDebug);
+    routeSelect.addEventListener('change', commitDebug);
+    updateDebugEnabledState();
+
+    controls.appendChild(debugGroup);
+
     const removeBtn = document.createElement('button');
     removeBtn.className = 'remove-btn';
     removeBtn.title = 'Remove remembered settings';
@@ -155,8 +287,15 @@ async function renderMemoryList() {
         }
         container.innerHTML = '';
 
-        const data = await storageGet({ siteSettings: {} });
+        const data = await storageGet({
+            siteSettings: {},
+            debugMode: false,
+            forceDrmCapture: false,
+            forceCorsCapture: false,
+            debugRouteMode: 'auto'
+        });
         const settings = data.siteSettings || {};
+        const globalDebugSettings = normalizeSiteDebugOverrides(data);
         const domains = Object.keys(settings).sort((a, b) => a.localeCompare(b));
 
         if (domains.length === 0) {
@@ -168,27 +307,42 @@ async function renderMemoryList() {
 
         for (const d of domains) {
             const entry = createMemoryEntry(d, settings[d], async (domain) => {
-                // remove
-                delete settings[domain];
-                await storageSet({ siteSettings: settings });
+                await updateSiteSettings((freshSettings) => {
+                    if (!Object.prototype.hasOwnProperty.call(freshSettings, domain)) return false;
+                    delete freshSettings[domain];
+                    return true;
+                });
             }, async (domain, newVal) => {
-                settings[domain] = { volume: normalizeDb(newVal.volume), mono: !!newVal.mono, muted: !!newVal.muted };
-                await storageSet({ siteSettings: settings });
+                await updateSiteSettings((freshSettings) => {
+                    const next = { ...(freshSettings[domain] || {}) };
+                    if (newVal.volume !== undefined) next.volume = normalizeDb(newVal.volume);
+                    if (newVal.mono !== undefined) next.mono = !!newVal.mono;
+                    if (newVal.muted !== undefined) next.muted = !!newVal.muted;
+                    if (Object.prototype.hasOwnProperty.call(newVal, 'debug')) {
+                        if (newVal.debug) next.debug = normalizeSiteDebugOverrides(newVal.debug);
+                        else delete next.debug;
+                    }
+                    freshSettings[domain] = next;
+                    return true;
+                });
             }, async (oldDomain, newDomain) => {
-                const nd = normalizeDomainInput(newDomain);
+                const nd = normalizeSiteSettingsEntryInput(newDomain);
                 if (!nd) {
                     alert('Site cannot be empty.');
                     return;
                 }
                 if (nd === oldDomain) return;
-                if (settings[nd]) {
-                    alert('A remembered entry for that site already exists.');
-                    return;
-                }
-                settings[nd] = settings[oldDomain];
-                delete settings[oldDomain];
-                await storageSet({ siteSettings: settings });
-            });
+                await updateSiteSettings((freshSettings) => {
+                    if (freshSettings[nd]) {
+                        alert('A remembered entry for that site/path already exists.');
+                        return false;
+                    }
+                    if (!Object.prototype.hasOwnProperty.call(freshSettings, oldDomain)) return false;
+                    freshSettings[nd] = freshSettings[oldDomain];
+                    delete freshSettings[oldDomain];
+                    return true;
+                });
+            }, globalDebugSettings);
 
             container.appendChild(entry);
         }
@@ -478,14 +632,11 @@ async function initOptions() {
 
         const addFqdn = async () => {
             const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false });
-            // Blocklist mode (v6.14): preserve a typed path so entries can be
-            // path-scoped ("twitch.tv/clips", "twitch.tv/*/clip/*" — * matches
-            // any characters except a slash). Whitelist mode adds remembered sites
-            // instead, and siteSettings is domain-keyed, so input there keeps
-            // normalizing to a bare domain. Pathless input canonicalizes the
-            // same way in both modes, so domain-style entries are unchanged.
+            // Blocklist and whitelist/remembered modes both support URL paths.
+            // Blocklist paths use block matching semantics; whitelist mode stores
+            // the path as a remembered profile.
             const v = data.whitelistMode
-                ? normalizeDomainInput(newFqdnInput.value)
+                ? normalizeSiteSettingsEntryInput(newFqdnInput.value)
                 : normalizeBlocklistEntryInput(newFqdnInput.value);
             if (!v) return;
             if (data.whitelistMode) {
@@ -532,12 +683,12 @@ async function initOptions() {
     const newRememberedInput = document.getElementById('newRememberedSite');
     if (addRememberedBtn && newRememberedInput) {
         addRememberedBtn.addEventListener('click', async () => {
-            const v = normalizeDomainInput(newRememberedInput.value);
+            const v = normalizeSiteSettingsEntryInput(newRememberedInput.value);
             if (!v) return;
             const data = await storageGet({ siteSettings: {} });
             const settings = data.siteSettings || {};
             if (settings[v]) {
-                alert('A remembered entry for that site already exists.');
+                alert('A remembered entry for that site/path already exists.');
                 return;
             }
             settings[v] = { volume: 0, mono: false };
@@ -600,8 +751,17 @@ async function initOptions() {
             forceCorsCaptureCheckbox.checked = !!changes.forceCorsCapture.newValue;
         }
         if (changes.debugRouteMode && debugRouteModeSelect) {
-            const value = changes.debugRouteMode.newValue;
-            debugRouteModeSelect.value = value === 'webaudio' || value === 'native' ? value : 'auto';
+            debugRouteModeSelect.value = normalizeDebugRouteMode(changes.debugRouteMode.newValue);
+        }
+
+        // Remembered rows that do not have a per-site override display the
+        // current global values in a disabled state, so keep them live too.
+        if (changes.debugMode || changes.forceDrmCapture || changes.forceCorsCapture || changes.debugRouteMode) {
+            if (memoryListRenderTimeout) clearTimeout(memoryListRenderTimeout);
+            memoryListRenderTimeout = setTimeout(() => {
+                renderMemoryList();
+                memoryListRenderTimeout = null;
+            }, 50);
         }
     });
 }
