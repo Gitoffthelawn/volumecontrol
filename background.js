@@ -11,13 +11,18 @@ const {
     storageGet,
     storageSet,
     tabsQuery,
+    tabsGet,
     tabsSendMessage,
     TOP_FRAME_OPTIONS,
     actionSetBadgeText,
     actionSetBadgeBackgroundColor,
     actionSetTitle,
     extractRootDomain,
+    normalizeSiteSettingsEntryInput,
+    normalizeBlocklistEntryInput,
     domainMatchesSaved,
+    isUrlRememberedByEntry,
+    isUrlBlockedByEntry,
     isUrlBlockedByEntries,
     purgeLegacyDefaultBlocklist,
     getSiteSettingsKey,
@@ -25,13 +30,205 @@ const {
     handleError
 } = globalThis.VolumeControlShared;
 const HOTKEY_STEP_DB = 1;
+const commandChains = new Map();
+let siteSettingsMutationChain = Promise.resolve();
+let accessListMutationChain = Promise.resolve();
+
+function mutateSiteSettings(mutation = {}) {
+    const run = async () => {
+        const data = await storageGet({ siteSettings: {} });
+        const siteSettings = { ...(data.siteSettings || {}) };
+        const type = String(mutation.type || "");
+        const rawKey = String(mutation.key == null ? "" : mutation.key).trim();
+        const normalizedKey = normalizeSiteSettingsEntryInput(rawKey);
+        let key = rawKey && Object.prototype.hasOwnProperty.call(siteSettings, rawKey)
+            ? rawKey
+            : normalizedKey;
+
+        if (type === "mergeForUrl" || type === "removeForUrl" || type === "ensureForUrl") {
+            const url = String(mutation.url || "");
+            const defaultKey = normalizeSiteSettingsEntryInput(mutation.defaultKey || url);
+            key = getSiteSettingsKey(siteSettings, url) || defaultKey;
+        }
+
+        if (!key) return { ok: false, reason: "invalid-key" };
+
+        if (type === "create") {
+            key = normalizedKey;
+            if (!key) return { ok: false, reason: "invalid-key" };
+            if (Object.prototype.hasOwnProperty.call(siteSettings, key)) return { ok: false, reason: "exists", key };
+            siteSettings[key] = {
+                volume: 0,
+                mono: false,
+                muted: false,
+                ...(mutation.value && typeof mutation.value === "object" ? mutation.value : {})
+            };
+        } else if (type === "ensureForUrl") {
+            const existing = getSiteSettingsKey(siteSettings, String(mutation.url || ""));
+            if (existing) return { ok: true, key: existing, created: false };
+            siteSettings[key] = {
+                volume: 0,
+                mono: false,
+                muted: false,
+                ...(mutation.value && typeof mutation.value === "object" ? mutation.value : {})
+            };
+            await storageSet({ siteSettings });
+            return { ok: true, key, created: true };
+        } else if (type === "merge" || type === "mergeForUrl") {
+            const current = siteSettings[key] || { volume: 0, mono: false, muted: false };
+            const patch = mutation.patch && typeof mutation.patch === "object" ? mutation.patch : {};
+            const next = { ...current, ...patch };
+            if (Object.prototype.hasOwnProperty.call(patch, "debug") && patch.debug == null) delete next.debug;
+            siteSettings[key] = next;
+        } else if (type === "remove" || type === "removeForUrl") {
+            delete siteSettings[key];
+        } else if (type === "rename") {
+            const newKey = normalizeSiteSettingsEntryInput(mutation.newKey);
+            if (!newKey) return { ok: false, reason: "invalid-key" };
+            if (!Object.prototype.hasOwnProperty.call(siteSettings, key)) return { ok: false, reason: "missing", key };
+            if (newKey !== key && Object.prototype.hasOwnProperty.call(siteSettings, newKey)) {
+                return { ok: false, reason: "exists", key: newKey };
+            }
+            if (newKey !== key) {
+                siteSettings[newKey] = siteSettings[key];
+                delete siteSettings[key];
+            }
+            await storageSet({ siteSettings });
+            return { ok: true, key: newKey };
+        } else {
+            return { ok: false, reason: "invalid-operation" };
+        }
+
+        await storageSet({ siteSettings });
+        return { ok: true, key };
+    };
+    siteSettingsMutationChain = siteSettingsMutationChain.then(run, run);
+    return siteSettingsMutationChain;
+}
+
+function mutateAccessLists(mutation = {}) {
+    const run = async () => {
+        const data = await storageGet({
+            fqdns: [],
+            whitelist: [],
+            archivedFqdns: [],
+            whitelistMode: false
+        });
+        let fqdns = Array.isArray(data.fqdns) ? [...data.fqdns] : [];
+        let whitelist = Array.isArray(data.whitelist) ? [...data.whitelist] : [];
+        let archivedFqdns = Array.isArray(data.archivedFqdns) ? [...data.archivedFqdns] : [];
+        let whitelistMode = Boolean(data.whitelistMode);
+        const type = String(mutation.type || "");
+        const url = String(mutation.url || "");
+
+        const save = async () => {
+            await storageSet({ fqdns, whitelist, archivedFqdns, whitelistMode });
+            return { ok: true, fqdns, whitelist, archivedFqdns, whitelistMode };
+        };
+
+        if (type === "setSiteActive") {
+            const active = Boolean(mutation.active);
+            if (whitelistMode) {
+                if (active) {
+                    const entry = normalizeSiteSettingsEntryInput(mutation.entry || url);
+                    if (!entry) return { ok: false, reason: "invalid-entry" };
+                    if (!whitelist.includes(entry)) whitelist.push(entry);
+                } else {
+                    whitelist = whitelist.filter(entry => !isUrlRememberedByEntry(url, entry));
+                }
+            } else if (active) {
+                fqdns = fqdns.filter(entry => !isUrlBlockedByEntry(url, entry));
+            } else {
+                const entry = normalizeBlocklistEntryInput(mutation.entry || url);
+                if (!entry) return { ok: false, reason: "invalid-entry" };
+                if (!fqdns.includes(entry)) fqdns.push(entry);
+            }
+            return save();
+        }
+
+        if (type === "addBlocklist") {
+            const entry = normalizeBlocklistEntryInput(mutation.entry);
+            if (!entry) return { ok: false, reason: "invalid-entry" };
+            if (fqdns.includes(entry)) return { ok: false, reason: "exists", entry };
+            fqdns.push(entry);
+            return save();
+        }
+
+        if (type === "removeBlocklist") {
+            const raw = String(mutation.entry || "");
+            fqdns = fqdns.filter(entry => entry !== raw);
+            return save();
+        }
+
+        if (type === "addWhitelist") {
+            const entry = normalizeSiteSettingsEntryInput(mutation.entry);
+            if (!entry) return { ok: false, reason: "invalid-entry" };
+            if (whitelist.includes(entry)) return { ok: false, reason: "exists", entry };
+            whitelist.push(entry);
+            return save();
+        }
+
+        if (type === "removeWhitelist") {
+            const raw = String(mutation.entry || "");
+            whitelist = whitelist.filter(entry => entry !== raw);
+            return save();
+        }
+
+        if (type === "setWhitelistMode") {
+            const enabled = Boolean(mutation.enabled);
+            if (enabled === whitelistMode) return { ok: true, fqdns, whitelist, archivedFqdns, whitelistMode };
+
+            if (enabled) {
+                if (fqdns.length) {
+                    archivedFqdns = [...fqdns];
+                    fqdns = [];
+                }
+                // Migration from the historical Remembered Settings allow-list
+                // is handled exactly once by migrateSeparatedWhitelistOnce().
+                // An intentionally empty whitelist must stay empty.
+                whitelistMode = true;
+            } else {
+                if (!fqdns.length && archivedFqdns.length) fqdns = [...archivedFqdns];
+                archivedFqdns = [];
+                whitelistMode = false;
+            }
+            return save();
+        }
+
+        return { ok: false, reason: "invalid-operation" };
+    };
+
+    accessListMutationChain = accessListMutationChain.then(run, run);
+    return accessListMutationChain;
+}
+
+function enqueueCommand(command, commandTab) {
+    const key = commandTab && Number.isInteger(commandTab.id) ? commandTab.id : "active";
+    const previous = commandChains.get(key) || Promise.resolve();
+    const next = previous.then(
+        () => handleCommand(command, commandTab),
+        () => handleCommand(command, commandTab)
+    ).finally(() => {
+        if (commandChains.get(key) === next) commandChains.delete(key);
+    });
+    commandChains.set(key, next);
+    return next;
+}
 
 async function getActiveTab(commandTab) {
-    // Always re-query instead of trusting the tab object passed by onCommand.
-    // Firefox (and some Chrome versions) may pass an incomplete tab (missing
-    // .url) without the full tabs permission. Re-querying with our existing
-    // host_permissions guarantees a complete tab object including url.
-    // The performance cost is negligible (one async tabs.query per hotkey press).
+    // Keep a queued hotkey bound to the tab that originated the command. If the
+    // user changes tabs while earlier key-repeat commands are still queued,
+    // re-querying "active" at execution time would retarget those later presses.
+    if (commandTab && Number.isInteger(commandTab.id)) {
+        try {
+            const tab = await tabsGet(commandTab.id);
+            if (tab) return tab;
+        } catch (e) {
+            // The original tab may have closed; fall through to the active tab.
+        }
+    }
+
+    if (commandTab && commandTab.url && Number.isInteger(commandTab.id)) return commandTab;
     const tabs = await tabsQuery({ active: true, currentWindow: true });
     return tabs && tabs[0] ? tabs[0] : null;
 }
@@ -39,14 +236,17 @@ async function getActiveTab(commandTab) {
 async function getDomainState(tab) {
     if (!tab || !tab.url || isRestrictedUrl(tab.url)) return null;
 
-    const data = await storageGet({ fqdns: [], whitelistMode: false, siteSettings: {} });
+    const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, whitelistSeparatedV1: false, siteSettings: {} });
     const siteSettings = data.siteSettings || {};
     const settingsKey = getSiteSettingsKey(siteSettings, tab.url);
     // Path-aware blocklist matching (issue #69): legacy path entries like
     // "www.twitch.tv/*/clip/*" scope to their path instead of blocking the
     // whole domain.
     const blocked = data.whitelistMode
-        ? !settingsKey
+        ? !(
+            (data.whitelist || []).some(entry => isUrlRememberedByEntry(tab.url, entry)) ||
+            (!data.whitelistSeparatedV1 && Boolean(settingsKey))
+        )
         : isUrlBlockedByEntries(tab.url, data.fqdns || []);
 
     return {
@@ -92,22 +292,11 @@ async function getContentState(tab) {
 
 async function saveRememberedSettings(domainState, updates) {
     if (!domainState || !domainState.settingsKey) return;
-
-    // Re-read the latest siteSettings instead of writing back the snapshot
-    // taken at the start of the command. Hotkey auto-repeat (Alt+Shift+Up held
-    // down) and a popup in another window interleave writes; writing a stale
-    // snapshot silently reverts the other writer's change (remembered mute
-    // lost on reload, increments swallowed).
-    const fresh = await storageGet({ siteSettings: {} }).catch(() => null);
-    const siteSettings = (fresh && fresh.siteSettings) || domainState.siteSettings || {};
-    const current = siteSettings[domainState.settingsKey] || { volume: 0, mono: false, muted: false };
-    siteSettings[domainState.settingsKey] = {
-        ...(current || {}),
-        volume: updates.volume !== undefined ? normalizeDb(updates.volume) : normalizeDb(current.volume),
-        mono: updates.mono !== undefined ? Boolean(updates.mono) : Boolean(current.mono),
-        muted: updates.muted !== undefined ? Boolean(updates.muted) : Boolean(current.muted)
-    };
-    await storageSet({ siteSettings });
+    const patch = {};
+    if (updates.volume !== undefined) patch.volume = normalizeDb(updates.volume);
+    if (updates.mono !== undefined) patch.mono = Boolean(updates.mono);
+    if (updates.muted !== undefined) patch.muted = Boolean(updates.muted);
+    await mutateSiteSettings({ type: "merge", key: domainState.settingsKey, patch });
 }
 
 async function getFallbackState(domainState) {
@@ -133,7 +322,10 @@ async function setVolume(tab, domainState, dB) {
         ? normalizeDb(response.response.volume)
         : requestedVolume;
 
-    await showNativeVolumeFeedback(tab.id, appliedVolume);
+    const muted = response && response.response && response.response.muted !== undefined
+        ? Boolean(response.response.muted)
+        : false;
+    await showNativeVolumeFeedback(tab.id, appliedVolume, muted);
     await saveRememberedSettings(domainState, { volume: appliedVolume });
 }
 
@@ -160,7 +352,7 @@ async function handleCommand(command, commandTab) {
     if (!tab || tab.id === undefined) return;
 
     const domainState = await getDomainState(tab);
-    if (domainState && domainState.blocked) return;
+    if (!domainState || domainState.blocked) return;
 
     const contentState = await getContentState(tab);
     const fallbackState = await getFallbackState(domainState);
@@ -211,7 +403,7 @@ async function showNativeVolumeFeedback(tabId, dB, muted) {
 
 if (browserApi && browserApi.commands && browserApi.commands.onCommand) {
     browserApi.commands.onCommand.addListener((command, tab) => {
-        handleCommand(command, tab).catch(handleError);
+        enqueueCommand(command, tab).catch(handleError);
     });
 }
 
@@ -223,8 +415,32 @@ if (browserApi && browserApi.commands && browserApi.commands.onCommand) {
 // install/update/startup (BEFORE the user can add anything through the UI)
 // closes that window: by the time cs.js start() or the options page sees the
 // storage, the flag is already set and hand-added entries are safe.
+async function migrateSeparatedWhitelistOnce() {
+    const run = async () => {
+        const data = await storageGet({
+            whitelistSeparatedV1: false,
+            whitelistMode: false,
+            whitelist: [],
+            siteSettings: {}
+        });
+        if (data.whitelistSeparatedV1) return;
+
+        const updates = { whitelistSeparatedV1: true };
+        if (data.whitelistMode && (!Array.isArray(data.whitelist) || data.whitelist.length === 0)) {
+            updates.whitelist = [...new Set(
+                Object.keys(data.siteSettings || {})
+                    .map(entry => normalizeSiteSettingsEntryInput(entry))
+                    .filter(Boolean)
+            )];
+        }
+        await storageSet(updates);
+    };
+    accessListMutationChain = accessListMutationChain.then(run, run);
+    return accessListMutationChain.catch(handleError);
+}
+
 async function purgeLegacyDefaultsOnce() {
-    try {
+    const run = async () => {
         const data = await storageGet({ fqdns: [], legacyTwitchDefaultsPurged: false });
         if (data.legacyTwitchDefaultsPurged) return;
         const purged = purgeLegacyDefaultBlocklist(data.fqdns || []);
@@ -232,9 +448,9 @@ async function purgeLegacyDefaultsOnce() {
             purged.changed ? { fqdns: purged.list } : {},
             { legacyTwitchDefaultsPurged: true }
         ));
-    } catch (e) {
-        handleError(e);
-    }
+    };
+    accessListMutationChain = accessListMutationChain.then(run, run);
+    return accessListMutationChain.catch(handleError);
 }
 if (browserApi && browserApi.runtime && browserApi.runtime.onInstalled) {
     browserApi.runtime.onInstalled.addListener(() => { purgeLegacyDefaultsOnce(); });
@@ -243,10 +459,31 @@ if (browserApi && browserApi.runtime && browserApi.runtime.onStartup) {
     browserApi.runtime.onStartup.addListener(() => { purgeLegacyDefaultsOnce(); });
 }
 purgeLegacyDefaultsOnce(); // MV3 worker wake (e.g. after an update) before any user interaction
+migrateSeparatedWhitelistOnce();
 
 if (browserApi && browserApi.runtime && browserApi.runtime.onMessage) {
     browserApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!message) return false;
+
+        if (message.command === "mutateSiteSettings") {
+            mutateSiteSettings(message.mutation)
+                .then((result) => sendResponse(result))
+                .catch((error) => {
+                    handleError(error);
+                    sendResponse({ ok: false, reason: "storage-error" });
+                });
+            return true;
+        }
+
+        if (message.command === "mutateAccessLists") {
+            mutateAccessLists(message.mutation)
+                .then((result) => sendResponse(result))
+                .catch((error) => {
+                    handleError(error);
+                    sendResponse({ ok: false, reason: "storage-error" });
+                });
+            return true;
+        }
 
         // Content scripts in cross-origin iframes cannot read window.top.location.
         // sender.tab.url is the authoritative top-level tab URL, so every frame
@@ -256,12 +493,28 @@ if (browserApi && browserApi.runtime && browserApi.runtime.onMessage) {
             return false;
         }
 
+        if (message.command === "frameBoostLimitReport") {
+            const tabId = sender && sender.tab && sender.tab.id;
+            const frameId = sender && Number.isInteger(sender.frameId) ? sender.frameId : 0;
+            if (Number.isInteger(tabId) && frameId > 0) {
+                tabsSendMessage(tabId, {
+                    command: "frameBoostLimitReport",
+                    frameId,
+                    reason: typeof message.reason === "string" ? message.reason : ""
+                }, TOP_FRAME_OPTIONS).catch(() => {});
+            }
+            sendResponse({});
+            return false;
+        }
+
         if (message.command === "topUrlChanged") {
             const tabId = sender && sender.tab && sender.tab.id;
             const url = typeof message.url === "string" && message.url
                 ? message.url
                 : (sender && sender.tab && sender.tab.url ? sender.tab.url : "");
             if (Number.isInteger(tabId)) {
+                actionSetBadgeText({ tabId, text: "" }).catch(handleError);
+                actionSetTitle({ tabId, title: "Volume Control" }).catch(handleError);
                 tabsSendMessage(tabId, { command: "profileUrlChanged", url }).catch(() => {});
             }
             sendResponse({});
@@ -281,9 +534,34 @@ if (browserApi && browserApi.runtime && browserApi.runtime.onMessage) {
 }
 
 
+async function clearAllTabFeedback() {
+    try {
+        const tabs = await tabsQuery({});
+        await Promise.all((tabs || [])
+            .filter(tab => Number.isInteger(tab.id))
+            .map(tab => Promise.all([
+                actionSetBadgeText({ tabId: tab.id, text: "" }).catch(handleError),
+                actionSetTitle({ tabId: tab.id, title: "Volume Control" }).catch(handleError)
+            ])));
+    } catch (e) {
+        handleError(e);
+    }
+}
+
+if (browserApi && browserApi.storage && browserApi.storage.onChanged) {
+    browserApi.storage.onChanged.addListener((changes, area) => {
+        if (area !== "local") return;
+        if (changes.fqdns || changes.whitelist || changes.whitelistMode || changes.whitelistSeparatedV1) {
+            clearAllTabFeedback();
+        }
+    });
+}
+
 if (browserApi && browserApi.tabs && browserApi.tabs.onUpdated) {
     browserApi.tabs.onUpdated.addListener((tabId, changeInfo) => {
         if (!changeInfo || !changeInfo.url) return;
+        actionSetBadgeText({ tabId, text: "" }).catch(handleError);
+        actionSetTitle({ tabId, title: "Volume Control" }).catch(handleError);
         tabsSendMessage(tabId, {
             command: "profileUrlChanged",
             url: changeInfo.url

@@ -34,9 +34,51 @@ function runBuild(...args) {
 const build = runBuild();
 assert.ifError(build.error);
 assert.equal(build.status, 0, build.stdout + build.stderr);
+const baseManifest = JSON.parse(readFileSync(join(fixtureRoot, 'manifest.json'), 'utf8'));
+
+function listZipEntries(zipPath) {
+    const escaped = zipPath.replace(/'/g, "''");
+    const command = [
+        'Add-Type -AssemblyName System.IO.Compression.FileSystem',
+        `$archive = [System.IO.Compression.ZipFile]::OpenRead('${escaped}')`,
+        'try { $archive.Entries | ForEach-Object { $_.FullName } } finally { $archive.Dispose() }'
+    ].join('; ');
+    const result = spawnSync(powershell, ['-NoProfile', '-Command', command], { encoding: 'utf8' });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    return result.stdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean).sort();
+}
 
 for (const browser of ['chrome', 'firefox']) {
     const packageDir = join(fixtureRoot, 'dist', browser);
+    const packageManifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8'));
+
+    test(`${browser}: manifest contains only browser-valid background metadata`, () => {
+        if (browser === 'chrome') {
+            assert.equal(packageManifest.minimum_chrome_version, baseManifest.minimum_chrome_version);
+            assert.equal(packageManifest.background.service_worker, 'background.js');
+            assert.equal('scripts' in packageManifest.background, false);
+            assert.equal('browser_specific_settings' in packageManifest, false);
+            assert.deepEqual(packageManifest.icons, { '128': 'chrome.png' });
+        } else {
+            assert.equal('minimum_chrome_version' in packageManifest, false);
+            assert.equal('service_worker' in packageManifest.background, false);
+            assert.deepEqual(packageManifest.background.scripts, ['shared.js', 'background.js']);
+            assert.ok(packageManifest.browser_specific_settings?.gecko);
+            assert.deepEqual(packageManifest.icons, { '96': 'ico.svg' });
+        }
+    });
+
+    test(`${browser}: ZIP contains exactly the packaged extension files`, () => {
+        const icon = browser === 'chrome' ? 'chrome.png' : 'ico.svg';
+        const zipPath = join(
+            fixtureRoot,
+            'dist',
+            `volume-control-${browser}-v${baseManifest.version}.zip`
+        );
+        const expected = [...assets, 'build-regression.js', 'manifest.json', icon].sort();
+        assert.deepEqual(listZipEntries(zipPath), expected);
+    });
 
     test(`${browser}: packaging preserves JavaScript behavior`, () => {
         const context = {};
@@ -143,9 +185,14 @@ for (const browser of ['chrome', 'firefox']) {
     });
 }
 
-test('background hotkeys preserve remembered debug/profile fields', () => {
+test('background serializes hotkeys and remembered-setting mutations', () => {
     const source = readFileSync(join(root, 'background.js'), 'utf8');
-    assert.match(source, /\.\.\.\(current \|\| \{\}\)/);
+    assert.match(source, /const commandChains = new Map\(\)/);
+    assert.match(source, /let siteSettingsMutationChain = Promise\.resolve\(\)/);
+    assert.match(source, /type === "mergeForUrl"/);
+    assert.match(source, /type === "ensureForUrl"/);
+    assert.match(source, /if \(!domainState \|\| domainState\.blocked\) return/);
+    assert.match(source, /enqueueCommand\(command, tab\)/);
     assert.match(source, /message\.command === "getTopTabUrl"/);
 });
 
@@ -157,6 +204,15 @@ test('content scripts resolve iframe profiles from the top tab URL and refresh o
     assert.match(source, /let startGeneration = 0/);
     assert.match(source, /generation !== startGeneration/);
     assert.match(source, /command: "topUrlChanged"/);
+    assert.match(source, /const PAGE_BRIDGE_TOKEN/);
+    assert.match(source, /data\.token !== PAGE_BRIDGE_TOKEN/);
+    assert.match(source, /let pageHookActivated = false/);
+    assert.match(source, /pageHookActivated = true/);
+    assert.doesNotMatch(source, /if \(!currentState\.enabled && !pageHookActivated\) return/);
+    assert.match(source, /stopBoostLimitObserver\(\)/);
+    assert.match(source, /command: "frameBoostLimitReport"/);
+    assert.match(source, /if \(!reason && lastPostedFrameReport\.reason === null && !force\) return/);
+    assert.match(source, /reportFrameBoostLimit\(true\)/);
     assert.match(source, /getSiteSettingsKey\(data\.siteSettings \|\| \{\}, controlUrl\)/);
     assert.match(source, /isUrlBlockedByEntries\(controlUrl, data\.fqdns \|\| \[\]\)/);
 });
@@ -170,6 +226,12 @@ test('page hook captures MediaStream/srcObject call audio and watches SPA histor
     assert.match(source, /function patchSpaNavigation\(\)/);
     assert.match(source, /"pushState", "replaceState"/);
     assert.match(source, /postToContentScript\("locationChanged"/);
+    assert.match(source, /extensionActive: false/);
+    assert.match(source, /function ensurePageHooksInstalled\(\)/);
+    assert.match(source, /data\.token !== bridgeToken/);
+    assert.match(source, /recorded destination rollback failed/);
+    assert.match(source, /unroute rollback failed/);
+    assert.match(source, /n < 0 \|\| n > 1/);
 });
 
 test('build refuses to delete or use the repository root as output', () => {
@@ -218,4 +280,237 @@ test('a missing build helper fails before replacing the existing release', () =>
     assert.match(result.stdout + result.stderr, /Required build helper is missing/);
     assert.ok(existsSync(existingFile));
     assert.ok(readFileSync(existingFile).equals(existingBytes));
+});
+
+
+test('popup only accepts a signed integer dB value and uses atomic URL settings mutations', () => {
+    const source = readFileSync(join(root, 'popup.js'), 'utf8');
+    assert.match(source, /function parseDbText\(value\)/);
+    assert.match(source, /type: "mergeForUrl"/);
+    assert.match(source, /type: "removeForUrl"/);
+    assert.match(source, /type: "setSiteActive"/);
+});
+
+test('options queues a rerender requested during an active render', () => {
+    const source = readFileSync(join(root, 'options.js'), 'utf8');
+    assert.match(source, /memoryListRenderPending = true/);
+    assert.match(source, /fqdnListRenderPending = true/);
+    assert.match(source, /queueMicrotask\(\(\) => renderMemoryList\(\)\)/);
+    assert.match(source, /command: "mutateSiteSettings"/);
+});
+
+test('daily prerelease compares against stable releases and ignores test-only script changes', () => {
+    const source = readFileSync(join(root, '.github/workflows/daily-prerelease.yml'), 'utf8');
+    assert.match(source, /git tag --list "V\*"/);
+    assert.match(source, /'LICENSE'/);
+    assert.match(source, /'scripts\/build\.ps1'/);
+    assert.match(source, /'scripts\/minify\.mjs'/);
+    assert.doesNotMatch(source, /\$_ -like 'scripts\/\*'/);
+});
+
+
+test('CI runs a real Chromium hook smoke test without an extra artifact dependency tree', () => {
+    const workflow = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
+    const smoke = readFileSync(join(root, 'scripts/browser-smoke.mjs'), 'utf8');
+    assert.match(workflow, /node scripts\/browser-smoke\.mjs/);
+    assert.doesNotMatch(workflow, /upload-build|@actions\/artifact/);
+    assert.match(smoke, /VC_BROWSER_SMOKE_PASS/);
+    assert.match(smoke, /disabledRestored/);
+    assert.match(smoke, /wrongTokenRejected/);
+});
+
+
+test('MAIN hook preflights early WebAudio but restores page APIs on exclusion', () => {
+    const source = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.match(source, /patchAudioNodeRouting\(\);\s*\n\s*try \{/);
+    assert.match(source, /function restorePatchedPageApis\(\)/);
+    assert.match(source, /if \(!state\.enabled\) restorePatchedPageApis\(\)/);
+    assert.match(source, /bridgeToken = null/);
+    assert.match(source, /data\.command !== "setState" && data\.command !== "heartbeat"/);
+});
+
+test('detached MediaStream media releases external stream listeners', () => {
+    const source = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.match(source, /function cleanupTrackedMediaElement\(element\)/);
+    assert.match(source, /entry\.streamCleanup\(\)/);
+    assert.match(source, /cleanupTrackedMediaElement\(element\)/);
+});
+
+test('isolated fallback never reuses a GainNode from a closed AudioContext', () => {
+    const source = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(source, /tc\.vars\.gainNode = undefined/);
+    assert.match(source, /Previously hooked media lost its AudioContext/);
+    assert.match(source, /syncPageAudioHook\(\);\s*\n\s*stopPageBridgeTimers\(\)/);
+});
+
+
+test('whitelist authorization is independent from remembered site settings', () => {
+    const background = readFileSync(join(root, 'background.js'), 'utf8');
+    const content = readFileSync(join(root, 'cs.js'), 'utf8');
+    const options = readFileSync(join(root, 'options.js'), 'utf8');
+    assert.match(background, /let accessListMutationChain = Promise\.resolve\(\)/);
+    assert.match(background, /type === "setWhitelistMode"/);
+    assert.match(background, /type === "setSiteActive"/);
+    assert.match(content, /\(data\.whitelist \|\| \[\]\)\.some/);
+    assert.doesNotMatch(content, /Whitelist is derived from remembered sites/);
+    assert.match(options, /type: "addWhitelist"/);
+});
+
+test('non-remembered SPA navigation resets ephemeral tab controls', () => {
+    const source = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(source, /lastResolvedControlUrl/);
+    assert.match(source, /controlUrl !== lastResolvedControlUrl/);
+    assert.match(source, /tc\.vars\.dB = 0/);
+});
+
+test('popup ignores stale async volume responses', () => {
+    const source = readFileSync(join(root, 'popup.js'), 'utf8');
+    assert.match(source, /let volumeRequestGeneration = 0/);
+    assert.match(source, /requestGeneration !== volumeRequestGeneration/);
+    assert.match(source, /command: "mutateAccessLists"/);
+});
+
+
+test('whitelist changes propagate without remembered settings', () => {
+    const popup = readFileSync(join(root, 'popup.js'), 'utf8');
+    const content = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(popup, /isUrlRememberedByEntry/);
+    assert.match(popup, /Allowed Sites/);
+    assert.match(content, /changes\.whitelist \|\|/);
+});
+
+
+test('all-frame manifest keeps the earliest supported fallback injection flags', () => {
+    const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.content_scripts.length >= 2, true);
+    for (const script of manifest.content_scripts) {
+        assert.equal(script.run_at, 'document_start');
+        assert.equal(script.all_frames, true);
+        assert.equal(script.match_about_blank, true);
+        assert.equal(script.match_origin_as_fallback, true);
+    }
+    assert.equal(manifest.content_scripts[0].world, 'MAIN');
+});
+
+
+test('existing whitelist-mode users migrate remembered allow entries once', () => {
+    const background = readFileSync(join(root, 'background.js'), 'utf8');
+    const content = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(background, /async function migrateSeparatedWhitelistOnce\(\)/);
+    assert.match(background, /whitelistSeparatedV1: true/);
+    assert.match(background, /Object\.keys\(data\.siteSettings \|\| \{\}\)/);
+    assert.match(content, /legacyAllowed = !data\.whitelistSeparatedV1/);
+});
+
+
+test('all blocklist/whitelist migrations share the serialized access-list queue', () => {
+    const background = readFileSync(join(root, 'background.js'), 'utf8');
+    const content = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(background, /accessListMutationChain = accessListMutationChain\.then\(run, run\)/);
+    assert.match(background, /async function purgeLegacyDefaultsOnce\(\)/);
+    assert.match(background, /async function migrateSeparatedWhitelistOnce\(\)/);
+    assert.doesNotMatch(content, /await storageSet\(Object\.assign\([\s\S]*legacyTwitchDefaultsPurged/);
+});
+
+
+test('exclusion teardown removes reversible per-element listeners without muting captured routes', () => {
+    const source = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.match(source, /listenerCleanup: null/);
+    assert.match(source, /function detachMediaElementListeners\(element\)/);
+    assert.match(source, /entry\.listenerCleanup = \(\) =>/);
+    assert.match(source, /if \(!mediaRoutes\.has\(element\)\)/);
+});
+
+
+test('whitelist migration is seamless in popup and hotkeys before the one-time write completes', () => {
+    const background = readFileSync(join(root, 'background.js'), 'utf8');
+    const popup = readFileSync(join(root, 'popup.js'), 'utf8');
+    assert.match(background, /!data\.whitelistSeparatedV1 && Boolean\(settingsKey\)/);
+    assert.match(popup, /legacyAllowed = !data\.whitelistSeparatedV1/);
+});
+
+
+test('AudioNode disconnect overloads keep route tracking in sync', () => {
+    const source = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.match(source, /typeof destination === "number"/);
+    assert.match(source, /takeDestinationConnections\(this, entry => entry\.outputIndex === outputIndex\)/);
+    assert.match(source, /if \(arguments\.length >= 3 && entry\.inputIndex !== inputIndex\) return false/);
+});
+
+test('AudioContext suspend and resume operations are serialized', () => {
+    const page = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    const content = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(page, /const pendingContextSuspends = new WeakMap\(\)/);
+    assert.match(page, /pendingContextSuspends\.get\(context\)/);
+    assert.match(content, /audioSuspendPromise/);
+    assert.match(content, /function resumeAudioContext\(\)/);
+});
+
+test('page wrapper ownership survives exclusion and re-enable', () => {
+    const source = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.match(source, /if \(ownsConnect && ownsDisconnect\) deletePatchMarker/);
+    assert.match(source, /if \(ownsPushState && ownsReplaceState\) deletePatchMarker/);
+    assert.match(source, /window\.Audio !== nativeAudioConstructor/);
+});
+
+test('non-remembered controls reset on same-URL media boundaries', () => {
+    const source = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(source, /function resetEphemeralControlsForMediaBoundary\(element\)/);
+    assert.match(source, /ephemeralBoundaryPending/);
+    assert.match(source, /element\.addEventListener\('loadstart'/);
+});
+
+test('startup preflight bounds native-media burst before authorization resolves', () => {
+    const source = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.match(source, /preflightMutedElements/);
+    assert.match(source, /document\.addEventListener\("play", preflightPlaybackCapture, true\)/);
+    assert.match(source, /setTimeout\(releasePreflightMediaMute, 250\)/);
+});
+
+
+test('queued hotkeys remain bound to their originating tab', () => {
+    const shared = readFileSync(join(root, 'shared.js'), 'utf8');
+    const background = readFileSync(join(root, 'background.js'), 'utf8');
+    assert.match(shared, /function tabsGet\(tabId\)/);
+    assert.match(background, /await tabsGet\(commandTab\.id\)/);
+    assert.match(background, /const key = commandTab && Number\.isInteger\(commandTab\.id\)/);
+});
+
+test('empty explicit whitelist stays empty after mode toggles', () => {
+    const source = readFileSync(join(root, 'background.js'), 'utf8');
+    assert.doesNotMatch(source, /if \(!whitelist\.length\) \{[\s\S]*Object\.keys\(data\.siteSettings/);
+    assert.match(source, /intentionally empty whitelist must stay empty/);
+});
+
+test('Options synchronizes whitelist checkbox and heading across windows', () => {
+    const source = readFileSync(join(root, 'options.js'), 'utf8');
+    assert.match(source, /changes\.whitelistMode && whitelistModeCheckbox/);
+    assert.match(source, /whitelistModeCheckbox\.checked = enabled/);
+    assert.match(source, /updateAccessListLabels\(enabled\)/);
+});
+
+test('access-list changes clear stale toolbar feedback', () => {
+    const source = readFileSync(join(root, 'background.js'), 'utf8');
+    assert.match(source, /async function clearAllTabFeedback\(\)/);
+    assert.match(source, /changes\.fqdns \|\| changes\.whitelist \|\| changes\.whitelistMode/);
+    assert.match(source, /actionSetBadgeText\(\{ tabId, text: "" \}\)/);
+});
+
+
+test('CI requires both Chromium and Firefox runtime smoke tests', () => {
+    const workflow = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
+    const chromium = readFileSync(join(root, 'scripts/browser-smoke.mjs'), 'utf8');
+    const firefox = readFileSync(join(root, 'scripts/firefox-smoke.mjs'), 'utf8');
+    assert.match(workflow, /REQUIRE_BROWSER_SMOKE: "1"/);
+    assert.match(workflow, /node scripts\/firefox-smoke\.mjs/);
+    assert.match(chromium, /throw new Error\(message\)/);
+    assert.match(firefox, /Firefox smoke passed/);
+});
+
+test('browser smoke covers startup mute restoration and page wrapper ownership', () => {
+    const source = readFileSync(join(root, 'scripts/browser-smoke.mjs'), 'utf8');
+    assert.match(source, /preflightMuted/);
+    assert.match(source, /preflightRestored/);
+    assert.match(source, /siteWrapperPreservedOnDisable/);
+    assert.match(source, /siteWrapperPreservedOnReenable/);
 });

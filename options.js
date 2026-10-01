@@ -7,6 +7,7 @@ const {
     formatDb,
     storageGet,
     storageSet,
+    runtimeSendMessage,
     callApi
 } = globalThis.VolumeControlShared;
 
@@ -14,19 +15,13 @@ const {
 let memoryListRenderTimeout = null;
 // debounce for fqdn list updates
 let fqdnListRenderTimeout = null;
-let siteSettingsWriteChain = Promise.resolve();
 
-function updateSiteSettings(mutator) {
-    const run = async () => {
-        const data = await storageGet({ siteSettings: {} });
-        const settings = { ...(data.siteSettings || {}) };
-        const result = await mutator(settings);
-        if (result === false) return false;
-        await storageSet({ siteSettings: settings });
-        return true;
-    };
-    siteSettingsWriteChain = siteSettingsWriteChain.then(run, run);
-    return siteSettingsWriteChain;
+function mutateSiteSettings(mutation) {
+    return runtimeSendMessage({ command: "mutateSiteSettings", mutation });
+}
+
+function mutateAccessLists(mutation) {
+    return runtimeSendMessage({ command: "mutateAccessLists", mutation });
 }
 
 function normalizeDebugRouteMode(value) {
@@ -275,9 +270,14 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename, globa
 
 let memoryListRendering = false;
 let fqdnListRendering = false;
+let memoryListRenderPending = false;
+let fqdnListRenderPending = false;
 
 async function renderMemoryList() {
-    if (memoryListRendering) return; // avoid concurrent renders
+    if (memoryListRendering) {
+        memoryListRenderPending = true;
+        return;
+    }
     memoryListRendering = true;
     try {
         const container = document.getElementById('memoryList');
@@ -307,24 +307,16 @@ async function renderMemoryList() {
 
         for (const d of domains) {
             const entry = createMemoryEntry(d, settings[d], async (domain) => {
-                await updateSiteSettings((freshSettings) => {
-                    if (!Object.prototype.hasOwnProperty.call(freshSettings, domain)) return false;
-                    delete freshSettings[domain];
-                    return true;
-                });
+                await mutateSiteSettings({ type: "remove", key: domain });
             }, async (domain, newVal) => {
-                await updateSiteSettings((freshSettings) => {
-                    const next = { ...(freshSettings[domain] || {}) };
-                    if (newVal.volume !== undefined) next.volume = normalizeDb(newVal.volume);
-                    if (newVal.mono !== undefined) next.mono = !!newVal.mono;
-                    if (newVal.muted !== undefined) next.muted = !!newVal.muted;
-                    if (Object.prototype.hasOwnProperty.call(newVal, 'debug')) {
-                        if (newVal.debug) next.debug = normalizeSiteDebugOverrides(newVal.debug);
-                        else delete next.debug;
-                    }
-                    freshSettings[domain] = next;
-                    return true;
-                });
+                const patch = {};
+                if (newVal.volume !== undefined) patch.volume = normalizeDb(newVal.volume);
+                if (newVal.mono !== undefined) patch.mono = !!newVal.mono;
+                if (newVal.muted !== undefined) patch.muted = !!newVal.muted;
+                if (Object.prototype.hasOwnProperty.call(newVal, 'debug')) {
+                    patch.debug = newVal.debug ? normalizeSiteDebugOverrides(newVal.debug) : null;
+                }
+                await mutateSiteSettings({ type: "merge", key: domain, patch });
             }, async (oldDomain, newDomain) => {
                 const nd = normalizeSiteSettingsEntryInput(newDomain);
                 if (!nd) {
@@ -332,16 +324,8 @@ async function renderMemoryList() {
                     return;
                 }
                 if (nd === oldDomain) return;
-                await updateSiteSettings((freshSettings) => {
-                    if (freshSettings[nd]) {
-                        alert('A remembered entry for that site/path already exists.');
-                        return false;
-                    }
-                    if (!Object.prototype.hasOwnProperty.call(freshSettings, oldDomain)) return false;
-                    freshSettings[nd] = freshSettings[oldDomain];
-                    delete freshSettings[oldDomain];
-                    return true;
-                });
+                const result = await mutateSiteSettings({ type: "rename", key: oldDomain, newKey: nd });
+                if (result && result.reason === "exists") alert('A remembered entry for that site/path already exists.');
             }, globalDebugSettings);
 
             container.appendChild(entry);
@@ -350,11 +334,18 @@ async function renderMemoryList() {
         console.error('Options: renderMemoryList error', e);
     } finally {
         memoryListRendering = false;
+        if (memoryListRenderPending) {
+            memoryListRenderPending = false;
+            queueMicrotask(() => renderMemoryList());
+        }
     }
 }
 
 async function renderFqdnList() {
-    if (fqdnListRendering) return; // avoid concurrent renders
+    if (fqdnListRendering) {
+        fqdnListRenderPending = true;
+        return;
+    }
     fqdnListRendering = true;
     try {
         const container = document.getElementById('fqdnList');
@@ -365,19 +356,7 @@ async function renderFqdnList() {
         container.innerHTML = '';
 
         const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {}, archivedFqdns: [] });
-        const fqdns = data.fqdns || [];
-        let list;
-        if (data.whitelistMode) {
-            // When whitelist mode is active we hide the blocklist; show an informational message about archived sites
-            const archivedCount = (data.archivedFqdns || []).length;
-            const empty = document.createElement('div');
-            empty.className = 'empty-msg';
-            empty.textContent = `Blocklist is hidden while whitelist mode is active. Archived ${archivedCount} site${archivedCount === 1 ? '' : 's'}. Manage allowed sites in Remembered Settings.`;
-            container.appendChild(empty);
-            return;
-        } else {
-            list = fqdns;
-        }
+        const list = data.whitelistMode ? (data.whitelist || []) : (data.fqdns || []);
 
         if (!list.length) {
             const empty = document.createElement('div');
@@ -402,19 +381,10 @@ async function renderFqdnList() {
             removeBtn.className = 'remove-btn';
             removeBtn.textContent = '×';
             removeBtn.addEventListener('click', async () => {
-                if (data.whitelistMode) {
-                    // remove from remembered siteSettings
-                    const sd = await storageGet({ siteSettings: {} });
-                    const settings = sd.siteSettings || {};
-                    if (settings[d]) {
-                        delete settings[d];
-                        await storageSet({ siteSettings: settings });
-                    }
-                } else {
-                    const idx = fqdns.indexOf(d);
-                    if (idx > -1) fqdns.splice(idx, 1);
-                    await storageSet({ fqdns });
-                }
+                await mutateAccessLists({
+                    type: data.whitelistMode ? "removeWhitelist" : "removeBlocklist",
+                    entry: d
+                });
             });
 
             controls.appendChild(removeBtn);
@@ -426,6 +396,10 @@ async function renderFqdnList() {
         console.error('Options: renderFqdnList error', e);
     } finally {
         fqdnListRendering = false;
+        if (fqdnListRenderPending) {
+            fqdnListRenderPending = false;
+            queueMicrotask(() => renderFqdnList());
+        }
     }
 }
 
@@ -530,48 +504,28 @@ async function initOptions() {
     const debugRouteModeSelect = document.getElementById('debugRouteMode');
     const addBtn = document.getElementById('addFqdn');
     const newFqdnInput = document.getElementById('newFqdn');
+    const listTitle = document.getElementById('listTitle');
+    const fqdnAddGroup = newFqdnInput ? newFqdnInput.parentElement : null;
+    const fqdnListContainer = document.getElementById('fqdnList');
+    const updateAccessListLabels = (enabled) => {
+        if (listTitle) listTitle.textContent = enabled ? 'Allowed Sites' : 'Blocked Sites';
+        if (fqdnAddGroup) fqdnAddGroup.style.display = 'flex';
+        if (fqdnListContainer) fqdnListContainer.style.display = 'block';
+    };
 
     if (whitelistModeCheckbox) {
         const data = await storageGet({ whitelistMode: false, archivedFqdns: [] });
         whitelistModeCheckbox.checked = !!data.whitelistMode;
-        const listTitle = document.getElementById('listTitle');
-        const fqdnAddGroup = newFqdnInput ? newFqdnInput.parentElement : null;
-        const fqdnListContainer = document.getElementById('fqdnList');
-
-        // Helper to show/hide the blocklist UI
-        function setBlocklistVisible(show) {
-            if (listTitle) listTitle.style.display = show ? 'block' : 'none';
-            if (fqdnAddGroup) fqdnAddGroup.style.display = show ? 'flex' : 'none';
-            if (fqdnListContainer) fqdnListContainer.style.display = show ? 'block' : 'none';
-        }
-
-        // Initialize visibility
-        setBlocklistVisible(!data.whitelistMode);
+        updateAccessListLabels(Boolean(data.whitelistMode));
 
         whitelistModeCheckbox.addEventListener('change', async (e) => {
             const enabled = e.target.checked;
-            if (enabled) {
-                // Archive current blacklist instead of deleting it
-                const d = await storageGet({ fqdns: [], archivedFqdns: [] });
-                if (d.fqdns && d.fqdns.length) {
-                    await storageSet({ archivedFqdns: d.fqdns, fqdns: [] });
-                } else {
-                    // ensure archivedFqdns exists
-                    await storageSet({ archivedFqdns: d.archivedFqdns || [] });
-                }
-                await storageSet({ whitelistMode: true });
-                setBlocklistVisible(false);
-            } else {
-                // Restore archived blacklist if current list is empty
-                const d = await storageGet({ fqdns: [], archivedFqdns: [] });
-                if ((!d.fqdns || d.fqdns.length === 0) && d.archivedFqdns && d.archivedFqdns.length) {
-                    await storageSet({ fqdns: d.archivedFqdns, archivedFqdns: [], whitelistMode: false });
-                } else {
-                    await storageSet({ whitelistMode: false });
-                }
-                setBlocklistVisible(true);
+            const result = await mutateAccessLists({ type: "setWhitelistMode", enabled });
+            if (!result || !result.ok) {
+                e.target.checked = !enabled;
+                return;
             }
-            // Immediately update displayed list so UI reflects mode change without waiting for storage.onChanged
+            updateAccessListLabels(enabled);
             await renderFqdnList();
         });
     }
@@ -632,35 +586,25 @@ async function initOptions() {
 
         const addFqdn = async () => {
             const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false });
-            // Blocklist and whitelist/remembered modes both support URL paths.
-            // Blocklist paths use block matching semantics; whitelist mode stores
-            // the path as a remembered profile.
+            // Blocklist and whitelist modes both support URL paths.
+            // Blocklist paths use exclusion semantics; whitelist paths use
+            // explicit allow-list matching independent from remembered audio.
             const v = data.whitelistMode
                 ? normalizeSiteSettingsEntryInput(newFqdnInput.value)
                 : normalizeBlocklistEntryInput(newFqdnInput.value);
             if (!v) return;
             if (data.whitelistMode) {
-                // Add as a remembered site so whitelist contains only remembered sites
-                const sd = await storageGet({ siteSettings: {} });
-                const settings = sd.siteSettings || {};
-                if (settings[v]) {
-                    // v6.15: say so instead of a silent no-op; keep the typed
-                    // text so it can be edited into a different site.
-                    showStatus(`"${v}" is already a remembered site.`);
+                const result = await mutateAccessLists({ type: "addWhitelist", entry: v });
+                if (!result || !result.ok) {
+                    showStatus(`"${v}" is already in your whitelist.`);
                     return;
                 }
-                settings[v] = { volume: 0, mono: false };
-                await storageSet({ siteSettings: settings });
             } else {
-                data.fqdns = data.fqdns || [];
-                if (data.fqdns.includes(v)) {
-                    // v6.15: say so instead of a silent no-op; keep the typed
-                    // text so it can be edited into a path/wildcard variant.
+                const result = await mutateAccessLists({ type: "addBlocklist", entry: v });
+                if (!result || !result.ok) {
                     showStatus(`"${v}" is already in your blocklist.`);
                     return;
                 }
-                data.fqdns.push(v);
-                await storageSet({ fqdns: data.fqdns });
             }
             // Refresh list immediately so the UI reflects the addition without waiting for storage.onChanged
             await renderFqdnList();
@@ -685,14 +629,15 @@ async function initOptions() {
         addRememberedBtn.addEventListener('click', async () => {
             const v = normalizeSiteSettingsEntryInput(newRememberedInput.value);
             if (!v) return;
-            const data = await storageGet({ siteSettings: {} });
-            const settings = data.siteSettings || {};
-            if (settings[v]) {
+            const result = await mutateSiteSettings({
+                type: "create",
+                key: v,
+                value: { volume: 0, mono: false, muted: false }
+            });
+            if (!result || !result.ok) {
                 alert('A remembered entry for that site/path already exists.');
                 return;
             }
-            settings[v] = { volume: 0, mono: false };
-            await storageSet({ siteSettings: settings });
             newRememberedInput.value = '';
         });
         newRememberedInput.addEventListener('keydown', (e) => {
@@ -727,14 +672,19 @@ async function initOptions() {
                 renderMemoryList();
                 memoryListRenderTimeout = null;
             }, 50);
-            // Also refresh fqdn list because whitelist mode displays remembered sites
+            // Remembered settings are independent from the explicit access list.
             if (fqdnListRenderTimeout) clearTimeout(fqdnListRenderTimeout);
             fqdnListRenderTimeout = setTimeout(() => {
                 renderFqdnList();
                 fqdnListRenderTimeout = null;
             }, 50);
         }
-        if (changes.fqdns || changes.whitelist || changes.whitelistMode) {
+        if (changes.whitelistMode && whitelistModeCheckbox) {
+            const enabled = Boolean(changes.whitelistMode.newValue);
+            whitelistModeCheckbox.checked = enabled;
+            updateAccessListLabels(enabled);
+        }
+        if (changes.fqdns || changes.whitelist || changes.whitelistMode || changes.archivedFqdns) {
             if (fqdnListRenderTimeout) clearTimeout(fqdnListRenderTimeout);
             fqdnListRenderTimeout = setTimeout(() => {
                 renderFqdnList();

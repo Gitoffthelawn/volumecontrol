@@ -14,6 +14,7 @@ const {
   tabsReload,
   openOptionsPage,
   domainMatchesSaved,
+  isUrlRememberedByEntry,
   isUrlBlockedByEntry,
   isUrlBlockedByEntries,
   entriesBlockingUrl,
@@ -24,6 +25,22 @@ const {
 const sharedExtractRootDomain = globalThis.VolumeControlShared.extractRootDomain;
 const WHEEL_STEP_DB = 1;  // volume change per wheel notch (matches hotkey step)
 let siteSettingsSaveChain = Promise.resolve();
+let volumeRequestGeneration = 0;
+
+function mutateSiteSettings(mutation) {
+  return runtimeSendMessage({ command: "mutateSiteSettings", mutation });
+}
+
+function mutateAccessLists(mutation) {
+  return runtimeSendMessage({ command: "mutateAccessLists", mutation });
+}
+
+function parseDbText(value) {
+  const raw = String(value == null ? "" : value).trim();
+  if (!/^[+-]?\d+$/.test(raw)) return null;
+  return normalizeDb(Number(raw));
+}
+
 const cached = {
   slider: null,
   volumeText: null,
@@ -51,8 +68,7 @@ function extractRootDomain(url) {
 // callers can use it as the verdict itself.
 function exclusionOverlayDetail(data, tabUrl) {
     if (data.whitelistMode) {
-        // Whitelist mode: the page is inactive because it is not remembered.
-        return "Whitelist mode is active, so only remembered sites are controlled. Use Settings to remember this site or turn whitelist mode off.";
+        return "Whitelist mode is active, so only sites in Allowed Sites are controlled. Turn the Active switch on to allow this page, add it in Settings, or turn whitelist mode off.";
     }
     const blocking = entriesBlockingUrl(tabUrl, data.fqdns || []);
     if (!blocking.length) return null;
@@ -161,11 +177,13 @@ function handleTabs(tabs) {
                 showError({ type: "exclusion" });
                 return;
             }
-            const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
+            const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, whitelistSeparatedV1: false, siteSettings: {} });
             let isExcluded = false;
             let detail = null;
             if (data.whitelistMode) {
-                isExcluded = !getSiteSettingsKey(data.siteSettings || {}, currentTab.url);
+                const explicitAllowed = (data.whitelist || []).some(entry => isUrlRememberedByEntry(currentTab.url, entry));
+                const legacyAllowed = !data.whitelistSeparatedV1 && Boolean(getSiteSettingsKey(data.siteSettings || {}, currentTab.url));
+                isExcluded = !(explicitAllowed || legacyAllowed);
                 if (isExcluded) detail = exclusionOverlayDetail(data, currentTab.url);
             } else {
                 detail = exclusionOverlayDetail(data, currentTab.url);
@@ -193,18 +211,23 @@ async function updateEnableSwitch(tab) {
     }
 
     try {
-        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
+        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, whitelistSeparatedV1: false, siteSettings: {} });
 
-        // When whitelist mode is active, remembered sites determine which pages are allowed.
-        // Hide the enable/active switch to avoid duplicate controls and potential user confusion.
         if (data.whitelistMode) {
-            if (switchLabel) switchLabel.style.display = 'none';
-            // v6.15: a non-remembered site is just as inactive as a blocklisted
-            // one — show the overlay explaining why (same verdict the content
-            // script enforces).
-            if (!getSiteSettingsKey(data.siteSettings || {}, tab.url)) {
-                showError({ type: "exclusion", detail: exclusionOverlayDetail(data, tab.url) });
+            const explicitAllowed = (data.whitelist || []).some(entry => isUrlRememberedByEntry(tab.url, entry));
+            const legacyAllowed = !data.whitelistSeparatedV1 && Boolean(getSiteSettingsKey(data.siteSettings || {}, tab.url));
+            const isAllowed = explicitAllowed || legacyAllowed;
+            if (checkbox) checkbox.checked = isAllowed;
+            if (switchLabel) {
+                switchLabel.style.display = '';
+                switchLabel.title = isAllowed
+                    ? "This site is explicitly allowed in whitelist mode."
+                    : "This site is not in your whitelist. Turning Active on adds it and reloads the page.";
             }
+            if (!isAllowed) showError({ type: "exclusion", detail: exclusionOverlayDetail(data, tab.url) });
+            checkbox.onchange = (e) => {
+                toggleSitePermission(domain, !e.target.checked, tab.id, tab.url);
+            };
             return;
         }
 
@@ -242,46 +265,14 @@ async function updateEnableSwitch(tab) {
 
 async function toggleSitePermission(domain, shouldExclude, tabId, tabUrl) {
     try {
-        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false });
-        const newData = {};
-
-        if (data.whitelistMode) {
-            // Edit remembered sites instead of an arbitrary whitelist
-            const sd = await storageGet({ siteSettings: {} });
-            const settings = sd.siteSettings || {};
-            const settingsKey = getSiteSettingsKey(settings, tabUrl || domain);
-            const defaultKey = normalizeSiteSettingsEntryInput(tabUrl || domain) || domain;
-            if (shouldExclude) {
-                if (settingsKey) {
-                    delete settings[settingsKey];
-                    await storageSet({ siteSettings: settings });
-                }
-            } else {
-                if (!settingsKey && defaultKey) {
-                    settings[defaultKey] = { volume: 0, mono: false, muted: false };
-                    await storageSet({ siteSettings: settings });
-                    // Try to apply settings immediately to the tab that requested the change
-                    if (tabId) {
-                        try {
-                            tabsSendMessage(tabId, { command: "setVolume", dB: settings[defaultKey].volume }).catch(() => {});
-                            tabsSendMessage(tabId, { command: "setMono", mono: Boolean(settings[defaultKey].mono) }).catch(() => {});
-                        } catch (e) { /* ignore */ }
-                    }
-                }
-            }
-        } else {
-            newData.fqdns = data.fqdns || [];
-            if (shouldExclude) {
-                if (!newData.fqdns.includes(domain)) newData.fqdns.push(domain);
-            } else {
-                // Remove EVERY entry that keeps this URL inactive — including
-                // legacy raw entries like "www.twitch.tv/*/clip/*" that an
-                // exact indexOf(domain) could never find (issue #69: toggling
-                // Active reloaded the page but stayed off).
-                newData.fqdns = newData.fqdns.filter(entry => !isUrlBlockedByEntry(tabUrl, entry));
-            }
-            await storageSet({ fqdns: newData.fqdns });
-        }
+        const url = tabUrl || domain;
+        const result = await mutateAccessLists({
+            type: "setSiteActive",
+            url,
+            entry: domain || url,
+            active: !shouldExclude
+        });
+        if (!result || !result.ok) throw new Error(result && result.reason ? result.reason : "Could not update site access");
 
         await tabsReload(tabId);
         window.close();
@@ -428,28 +419,23 @@ async function saveSiteSettingsNow(tab) {
         const monoCheckbox = cached.monoCheckbox || document.getElementById("mono-checkbox");
         const muteBtn = cached.muteBtn || document.getElementById("mute-btn");
 
-        const data = await storageGet({ siteSettings: {} });
-        data.siteSettings = data.siteSettings || {};
-        const settingsKey = getSiteSettingsKey(data.siteSettings, tab.url) || defaultSettingsKey;
-        // Preserve optional per-site debug overrides when the popup updates
-        // volume/mono/mute. Older code replaced the whole remembered record,
-        // which would silently erase the debug profile on every volume change.
-        data.siteSettings[settingsKey] = {
-            ...(data.siteSettings[settingsKey] || {}),
+        const patch = {
             volume: normalizeControlDb(volumeSlider?.value),
             mono: Boolean(monoCheckbox?.checked),
             muted: Boolean(muteBtn && muteBtn.classList.contains("muted"))
         };
-        await storageSet({ siteSettings: data.siteSettings });
+        await mutateSiteSettings({
+            type: "mergeForUrl",
+            url: tab.url,
+            defaultKey: defaultSettingsKey,
+            patch
+        });
 
-        // Notify the content script in this tab immediately so volume/mono/mute are applied without waiting
         if (tab && tab.id) {
             try {
-                tabsSendMessage(tab.id, { command: "setVolume", dB: data.siteSettings[settingsKey].volume }).catch(() => {
-                    // It's possible the content script hasn't injected into the page yet; ignore harmless errors.
-                });
-                tabsSendMessage(tab.id, { command: "setMono", mono: Boolean(data.siteSettings[settingsKey].mono) }).catch(() => {});
-                tabsSendMessage(tab.id, { command: "setMute", muted: Boolean(data.siteSettings[settingsKey].muted) }).catch(() => {});
+                tabsSendMessage(tab.id, { command: "setVolume", dB: patch.volume }).catch(() => {});
+                tabsSendMessage(tab.id, { command: "setMono", mono: patch.mono }).catch(() => {});
+                tabsSendMessage(tab.id, { command: "setMute", muted: patch.muted }).catch(() => {});
             } catch (e) {
                 // ignore messaging errors
             }
@@ -466,6 +452,7 @@ function saveSiteSettings(tab) {
 }
 
 async function setVolume(dB, tab, options = {}) {
+  const requestGeneration = ++volumeRequestGeneration;
   let normalizedDb = setDisplayedVolume(dB);
 
   if (tab) {
@@ -484,6 +471,11 @@ async function setVolume(dB, tab, options = {}) {
       const response = await tabsSendMessage(tab.id, {
           command: "getAudioControlState"
       }, TOP_FRAME_OPTIONS).catch(handleError);
+
+      // A newer slider/text request has already been issued. The newer message
+      // is authoritative; do not let this older response snap the UI backward,
+      // overwrite its remembered value, or repaint the badge.
+      if (requestGeneration !== volumeRequestGeneration) return;
 
       if (response && response.response) {
           applyAudioControlState(response.response);
@@ -546,12 +538,7 @@ async function toggleRemember(tab) {
         if (rememberCheckbox && rememberCheckbox.checked) {
             await saveSiteSettings(tab);
         } else {
-            const data = await storageGet({ siteSettings: {} });
-            const settingsKey = getSiteSettingsKey(data.siteSettings, tab.url);
-            if (data.siteSettings && settingsKey) {
-                delete data.siteSettings[settingsKey];
-                await storageSet({ siteSettings: data.siteSettings });
-            }
+            await mutateSiteSettings({ type: "removeForUrl", url: tab.url });
         }
     } catch (e) {
         handleError(e);
@@ -578,7 +565,7 @@ function showError(error) {
         // generic line when the verdict came without storage data.
         const detail = exclusionMessage.querySelector(".exclusion-detail");
         if (detail) {
-            detail.textContent = error.detail || "This site is excluded in your blocklist, or not remembered in whitelist mode.";
+            detail.textContent = error.detail || "This site is excluded by your blocklist, or it is not in Allowed Sites while whitelist mode is active.";
         }
         // Make the exclusion message a live region so screen readers announce it,
         // and make it focusable so we can move focus to it.
@@ -677,21 +664,20 @@ async function initializeControls(tab) {
       // (e.g. "-15") before we commit, avoiding partial-number jumps.
       let textCommitTimer = null;
       volumeText.addEventListener("input", () => {
-           const val = volumeText.value.match(/-?\d+/)?.[0];
-           if (val === undefined) return;          // ignore "-", "+", "", etc.
-           if (textCommitTimer) clearTimeout(textCommitTimer);
-           const parsed = Number(val);
-           textCommitTimer = setTimeout(() => {
-               textCommitTimer = null;
-               setVolume(normalizeDb(parsed), tab);
-           }, 300);
-      });
+            const parsed = parseDbText(volumeText.value);
+            if (parsed === null) return;
+            if (textCommitTimer) clearTimeout(textCommitTimer);
+            textCommitTimer = setTimeout(() => {
+                textCommitTimer = null;
+                setVolume(parsed, tab);
+            }, 300);
+       });
       // Commit immediately on Enter so the user does not have to wait
       // for the debounce, and reformat the field on blur.
       volumeText.addEventListener("change", () => {
            if (textCommitTimer) { clearTimeout(textCommitTimer); textCommitTimer = null; }
-           const val = volumeText.value.match(/-?\d+/)?.[0];
-           if (val) setVolume(normalizeDb(val), tab);
+           const parsed = parseDbText(volumeText.value);
+            if (parsed !== null) setVolume(parsed, tab);
       });
       // Suppress the global keydown-to-slider-focus handler while the user
       // is editing the dB field so arrow keys edit the number, not the slider.

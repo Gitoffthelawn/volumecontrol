@@ -7,6 +7,7 @@ const {
     storageSet,
     runtimeSendMessage,
     domainMatchesSaved,
+    isUrlRememberedByEntry,
     isUrlBlockedByEntries,
     purgeLegacyDefaultBlocklist,
     getSiteSettingsKey,
@@ -17,6 +18,18 @@ const sharedExtractRootDomain = globalThis.VolumeControlShared.extractRootDomain
 const PAGE_BRIDGE_SOURCE = "volume-control-extension";
 const PAGE_BRIDGE_TARGET = "volume-control-page-audio";
 const PAGE_AUDIO_MANAGED_ATTR = "vcPageAudioManaged";
+// Per-document capability token. MAIN-world bridge messages must carry this
+// unpredictable token; ordinary page scripts no longer get to spoof setState,
+// heartbeat, navigation, or restriction messages just by knowing our strings.
+const PAGE_BRIDGE_TOKEN = (() => {
+    try {
+        const bytes = new Uint32Array(4);
+        crypto.getRandomValues(bytes);
+        return Array.from(bytes, value => value.toString(16).padStart(8, "0")).join("");
+    } catch (e) {
+        return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2) + "-" + Math.random().toString(36).slice(2);
+    }
+})();
 const PAGE_BRIDGE_RESYNC_MS = 5000;
 const PAGE_BRIDGE_HEARTBEAT_MS = 3000;
 const BOOST_LIMIT_NOTES = {
@@ -28,6 +41,7 @@ const BOOST_LIMIT_NOTES = {
 let pageBridgeResyncInterval = null;
 let controlProfileReady = false;
 let profileControlUrl = "";
+let lastResolvedControlUrl = "";
 let startGeneration = 0;
 
 const tc = {
@@ -51,18 +65,42 @@ const tc = {
     // All known media elements on the page (hooked, fallback, or page-managed).
     // Populated by registerMediaElement and init. Used by applyState to avoid
     // querySelectorAll on every state change.
-    knownMediaElements: new Set()
+    knownMediaElements: new Set(),
+    audioSuspendPromise: null,
+    hasRememberedSettings: false,
+    ephemeralActiveElement: null,
+    ephemeralSourceKeys: new WeakMap(),
+    ephemeralBoundaryPending: new WeakSet()
   }
 };
 
 const logTypes = ["ERROR", "WARNING", "INFO", "DEBUG"];
 function log(msg, level = 4) {
-  if (tc.settings.logLevel >= level) console.log(`[VolumeControl] ${logTypes[level-2]}: ${msg}`);
+  if (tc.settings.logLevel < level) return;
+  const index = Math.max(0, Math.min(logTypes.length - 1, Number(level) - 2));
+  console.log(`[VolumeControl] ${logTypes[index]}: ${msg}`);
 }
 
 if (browserAPI) {
     browserAPI.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!msg) return;
+        if (msg.command === "frameBoostLimitReport") {
+            if (!isTopFrame() || tc.vars.isBlocked) return;
+            const frameId = Number(msg.frameId);
+            if (!Number.isInteger(frameId) || frameId <= 0) return;
+            const reason = reasonSeverity(msg.reason) > 0 ? msg.reason : "";
+            const previous = frameLimitReports.get(frameId);
+            if (!reason) {
+                if (frameLimitReports.delete(frameId)) invalidateBoostLimitCache();
+                sendResponse({});
+                return;
+            }
+            frameLimitReports.set(frameId, { reason, ts: Date.now() });
+            ensureFrameReportPurge();
+            if (!previous || previous.reason !== reason) invalidateBoostLimitCache();
+            sendResponse({});
+            return;
+        }
         if (msg.command === "profileUrlChanged") {
             if (typeof msg.url === "string" && msg.url) profileControlUrl = msg.url;
             start();
@@ -150,24 +188,12 @@ function isLikelyCrossOriginMedia(element) {
 
     try {
         const url = new URL(src, document.baseURI);
-        return url.protocol.indexOf("http") === 0 && url.origin !== window.location.origin;
+        const pageOrigin = (typeof globalThis.origin === "string" && globalThis.origin) || window.location.origin;
+        if (!pageOrigin || pageOrigin === "null") return false;
+        return url.protocol.indexOf("http") === 0 && url.origin !== pageOrigin;
     } catch (e) {
         return false;
     }
-}
-
-function isLikelyRestrictedMedia(element) {
-    if (!element) return false;
-
-    try {
-        if (element.dataset && element.dataset.vcRestrictedMedia === "true") return true;
-        if (element.mediaKeys) return true;
-        if (element.webkitKeys) return true;
-    } catch (e) {
-        return false;
-    }
-
-    return false;
 }
 
 function pageUsesEme() {
@@ -233,14 +259,6 @@ function elementEmeKeysAttached(element) {
         return false;
     }
     return false;
-}
-
-function pageCreatedMediaKeys() {
-    try {
-        return Boolean(document.documentElement && document.documentElement.dataset.vcPageEmeActive === "true");
-    } catch (e) {
-        return false;
-    }
 }
 
 // Pending EME suspect: the page was granted EME access (probe) and the
@@ -421,10 +439,12 @@ function getBoostLimitReason(element) {
 // and by a TTL to catch async state changes (e.g., mediaKeys being set).
 let boostLimitCache = null;
 let boostLimitCacheTime = 0;
+let boostLimitObserver = null;
 const BOOST_LIMIT_CACHE_TTL_MS = 1000;
 
 function invalidateBoostLimitCache() {
     boostLimitCache = null;
+    scheduleFrameBoostLimitReport();
 }
 
 function getBoostLimitInfo() {
@@ -487,17 +507,15 @@ function getBoostLimitInfo() {
 }
 
 // ----- Cross-frame boost-limit aggregation --------------------------------
-// Popup/background state queries are answered by the TOP frame only (since
-// v6.9: an unframed tabs.sendMessage resolves with whichever frame responds
-// first, which made the DRM/boost-limit note flicker on udio.com). But DRM or
-// cross-origin media often plays inside an embedded iframe (widget players,
-// embedded players) whose document the top frame cannot scan. Each frame's
-// content script therefore posts its verdict up to the top frame, and the top
-// frame merges the most restrictive live report into its own verdict. Reports
-// expire, so frames that go away relax the verdict deterministically — no
-// response races, no flicker.
-const FRAME_REPORT_TTL_MS = 2500;
-const frameLimitReports = new Map(); // source window -> { reason, ts }
+// Child frames report through extension messaging instead of page
+// window.postMessage. Page scripts therefore cannot forge a DRM/CORS report
+// and clamp the whole tab. Reports expire so removed frames relax naturally.
+const FRAME_REPORT_TTL_MS = 15000;
+const FRAME_REPORT_REFRESH_MS = 5000;
+const frameLimitReports = new Map(); // frameId -> { reason, ts }
+let frameReportInterval = null;
+let frameReportPurgeInterval = null;
+let frameReportScheduled = false;
 
 function isTopFrame() {
     try {
@@ -511,83 +529,95 @@ function getAggregatedFrameLimit() {
     if (!isTopFrame() || frameLimitReports.size === 0) return null;
     const now = Date.now();
     let best = null;
-    for (const [source, entry] of Array.from(frameLimitReports)) {
-        if (!source || now - entry.ts > FRAME_REPORT_TTL_MS) {
-            frameLimitReports.delete(source);
+    for (const [frameId, entry] of Array.from(frameLimitReports)) {
+        if (!Number.isInteger(frameId) || now - entry.ts > FRAME_REPORT_TTL_MS) {
+            frameLimitReports.delete(frameId);
             continue;
         }
-        if (!best || reasonSeverity(entry.reason) > reasonSeverity(best.reason)) {
-            best = entry;
-        }
+        if (!best || reasonSeverity(entry.reason) > reasonSeverity(best.reason)) best = entry;
+    }
+    if (frameLimitReports.size === 0 && frameReportPurgeInterval !== null) {
+        clearInterval(frameReportPurgeInterval);
+        frameReportPurgeInterval = null;
     }
     return best;
 }
 
-function handleFrameLimitReport(event) {
-    // Only the top frame aggregates. Reports come from child windows; a page
-    // script posting to its own window (source === window) is not a frame
-    // report and must not influence the verdict.
-    if (!isTopFrame() || !event.source || event.source === window) return;
-    const data = event.data;
-    if (!data || data.vcFrameBoostLimitVersion !== 1) return;
-    const report = data.vcFrameBoostLimit;
-    if (!report || typeof report.reason !== "string") return;
-
-    const reason = reasonSeverity(report.reason) > 0 ? report.reason : "";
-    const previous = frameLimitReports.get(event.source);
-    frameLimitReports.set(event.source, { reason, ts: Date.now() });
-    if (!previous || previous.reason !== reason) {
-        invalidateBoostLimitCache();
-    }
+function ensureFrameReportPurge() {
+    if (!isTopFrame() || frameReportPurgeInterval !== null || frameLimitReports.size === 0) return;
+    frameReportPurgeInterval = setInterval(() => getAggregatedFrameLimit(), FRAME_REPORT_REFRESH_MS);
 }
 
-window.addEventListener("message", handleFrameLimitReport);
+function ensureFrameReportRefresh() {
+    if (isTopFrame() || frameReportInterval !== null) return;
+    frameReportInterval = setInterval(() => reportFrameBoostLimit(true), FRAME_REPORT_REFRESH_MS);
+}
 
-// Non-top frames report their verdict to the top frame. Reports post
-// immediately when the verdict CHANGES and otherwise refresh the top frame's
-// TTL entry at half its lifetime (2.5s TTL / 2s heartbeat) — posting
-// unconditionally every second only burned CPU/postMessage volume on
-// iframe-heavy pages with stable verdicts.
 let lastPostedFrameReport = { reason: null, at: 0 };
-function reportFrameBoostLimit() {
-    if (isTopFrame()) return;
-    if (!controlProfileReady || tc.vars.isBlocked) return;
-    try {
-        const limit = getBoostLimitInfo();
-        const now = Date.now();
-        if (limit.reason === lastPostedFrameReport.reason && now - lastPostedFrameReport.at < 2000) return;
-        lastPostedFrameReport = { reason: limit.reason, at: now };
-        window.top.postMessage({
-            vcFrameBoostLimitVersion: 1,
-            vcFrameBoostLimit: {
-                reason: limit.reason,
-                maxDb: limit.maxDb,
-                boostLimited: limit.boostLimited
-            }
-        }, "*");
-    } catch (e) {
-        // window.top can be inaccessible in exotic frame setups; nothing to do.
+function reportFrameBoostLimit(force = false) {
+    if (isTopFrame() || !controlProfileReady || tc.vars.isBlocked) return;
+
+    const limit = getBoostLimitInfo();
+    const reason = limit.reason || "";
+    const now = Date.now();
+
+    // An unrestricted child has nothing to contribute until it previously
+    // reported a restriction. Avoid waking the service worker every five
+    // seconds for the common case of harmless iframes.
+    if (!reason && lastPostedFrameReport.reason === null && !force) return;
+    if (!reason && lastPostedFrameReport.reason === "") return;
+    if (!force && reason === lastPostedFrameReport.reason &&
+        now - lastPostedFrameReport.at < FRAME_REPORT_REFRESH_MS) return;
+
+    lastPostedFrameReport = { reason, at: now };
+    runtimeSendMessage({
+        command: "frameBoostLimitReport",
+        reason
+    }).catch(() => {});
+
+    if (reason) {
+        ensureFrameReportRefresh();
+    } else if (frameReportInterval !== null) {
+        clearInterval(frameReportInterval);
+        frameReportInterval = null;
     }
 }
 
-if (!isTopFrame()) {
-    reportFrameBoostLimit();
-    setInterval(reportFrameBoostLimit, 1000);
-} else {
-    // Purge expired frame reports on a timer, not only when a verdict is
-    // requested. On a tab that is merely playing audio (no popup/hotkey
-    // activity) getAggregatedFrameLimit is never called; expired entries pin
-    // the REMOVED iframes' Window objects against GC for the tab's lifetime
-    // (ad-refresh loops churn iframes constantly).
-    setInterval(() => {
-        getAggregatedFrameLimit();
-    }, 2500);
+function scheduleFrameBoostLimitReport() {
+    if (isTopFrame() || !controlProfileReady || tc.vars.isBlocked || frameReportScheduled) return;
+    frameReportScheduled = true;
+    queueMicrotask(() => {
+        frameReportScheduled = false;
+        reportFrameBoostLimit();
+    });
+}
+
+function startFrameReporting() {
+    if (isTopFrame()) return;
+    // One initial report (including "unrestricted") clears a stale report for
+    // the same frameId after iframe navigation. Only real restrictions get a
+    // periodic refresh afterwards.
+    reportFrameBoostLimit(true);
+}
+
+function stopFrameReporting() {
+    if (frameReportInterval !== null) {
+        clearInterval(frameReportInterval);
+        frameReportInterval = null;
+    }
+    if (frameReportPurgeInterval !== null) {
+        clearInterval(frameReportPurgeInterval);
+        frameReportPurgeInterval = null;
+    }
+    lastPostedFrameReport = { reason: null, at: 0 };
+    frameReportScheduled = false;
+    if (isTopFrame()) frameLimitReports.clear();
 }
 
 function setupBoostLimitObserver() {
     // Invalidate the boost limit cache when audio/video elements are added or
     // removed from the DOM, so the next call to getBoostLimitInfo recomputes.
-    if (typeof MutationObserver === 'undefined') return;
+    if (boostLimitObserver || typeof MutationObserver === 'undefined') return;
     const observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
             for (const node of mutation.addedNodes) {
@@ -606,7 +636,9 @@ function setupBoostLimitObserver() {
             }
         }
     });
+    boostLimitObserver = observer;
     const startObserving = () => {
+        if (boostLimitObserver !== observer) return;
         observer.observe(document.documentElement || document, { childList: true, subtree: true });
     };
     if (document.documentElement) {
@@ -614,6 +646,12 @@ function setupBoostLimitObserver() {
     } else {
         document.addEventListener('DOMContentLoaded', startObserving, { once: true });
     }
+}
+
+function stopBoostLimitObserver() {
+    if (!boostLimitObserver) return;
+    boostLimitObserver.disconnect();
+    boostLimitObserver = null;
 }
 
 function normalizeDbForCurrentMedia(value) {
@@ -745,6 +783,7 @@ function clearFallbackVolume(element) {
 // slider movements from triggering unnecessary applyStateToGraphs() /
 // applyStateToMediaElements() cycles on the page, which can cause audio dropouts.
 let lastSyncedPageAudioState = null;
+let pageHookActivated = false;
 
 function syncPageAudioHook() {
     const currentState = {
@@ -770,16 +809,21 @@ function syncPageAudioHook() {
         lastSyncedPageAudioState.debugRouteMode === currentState.debugRouteMode) {
         return;
     }
+    // The MAIN-world hook installs only a transparent AudioNode interceptor at
+    // document_start. Always send the resolved state, including "disabled", so
+    // an excluded page can immediately restore its native prototypes.
     lastSyncedPageAudioState = currentState;
 
     try {
         window.postMessage({
             source: PAGE_BRIDGE_SOURCE,
             target: PAGE_BRIDGE_TARGET,
+            token: PAGE_BRIDGE_TOKEN,
             command: "setState",
             version: BRIDGE_VERSION,
             ...currentState
         }, "*");
+        pageHookActivated = true;
     } catch (e) {
         if (tc.settings.debugMode) log(`page audio sync failed: ${e.message}`, 3);
     }
@@ -793,6 +837,7 @@ function sendPageAudioHeartbeat() {
         window.postMessage({
             source: PAGE_BRIDGE_SOURCE,
             target: PAGE_BRIDGE_TARGET,
+            token: PAGE_BRIDGE_TOKEN,
             command: "heartbeat",
             version: BRIDGE_VERSION
         }, "*");
@@ -862,7 +907,7 @@ function applyState() {
 
             if (el.dataset.vcHooked === "true") {
                 if (routeNeeded && isMediaPlaying(el) && tc.vars.audioCtx && tc.vars.audioCtx.state === 'suspended') {
-                    tc.vars.audioCtx.resume().then(applyState);
+                    resumeAudioContext();
                 }
                 continue;
             }
@@ -940,6 +985,32 @@ function ensurePageBridgeHeartbeat() {
     pageBridgeHeartbeatInterval = setInterval(sendPageAudioHeartbeat, PAGE_BRIDGE_HEARTBEAT_MS);
 }
 
+function stopPageBridgeTimers() {
+    if (pageBridgeResyncInterval !== null) {
+        clearInterval(pageBridgeResyncInterval);
+        pageBridgeResyncInterval = null;
+    }
+    if (pageBridgeHeartbeatInterval !== null) {
+        clearInterval(pageBridgeHeartbeatInterval);
+        pageBridgeHeartbeatInterval = null;
+    }
+}
+
+function resumeAudioContext() {
+    const context = tc.vars.audioCtx;
+    if (!context || typeof context.resume !== "function") return Promise.resolve();
+    const resumeNow = async () => {
+        try {
+            if (context.state === "suspended") await context.resume();
+            applyState();
+        } catch (e) {
+            if (tc.settings.debugMode) log(`audio context resume failed: ${e && e.message}`, 2);
+        }
+    };
+    const pending = tc.vars.audioSuspendPromise;
+    return pending ? pending.catch(() => {}).then(resumeNow) : resumeNow();
+}
+
 function suspendAudioContextIfIdle() {
     if (!tc.vars.audioCtx || tc.vars.audioCtx.state === 'closed') return;
     if (tc.vars.audioCtx.state !== 'running') return;
@@ -984,16 +1055,58 @@ function suspendAudioContextIfIdle() {
     // alive lets already-hooked elements resume on the same context, and
     // lets new elements reuse the suspended context instead of creating a
     // wasteful new one.
+    if (tc.vars.audioSuspendPromise) return;
+    const context = tc.vars.audioCtx;
+    let promise;
+    promise = Promise.resolve()
+        .then(() => context.suspend())
+        .then(() => {
+            if (tc.settings.debugMode) {
+                log(hasHooked
+                    ? "audio context suspended (media paused) — device handle released"
+                    : "audio context suspended (no hooked media) — device handle released", 4);
+            }
+        })
+        .catch((e) => {
+            if (tc.settings.debugMode) log(`audio context suspend failed: ${e && e.message}`, 2);
+        })
+        .finally(() => {
+            if (tc.vars.audioSuspendPromise === promise) tc.vars.audioSuspendPromise = null;
+        });
+    tc.vars.audioSuspendPromise = promise;
+}
+
+function mediaSourceKey(element) {
     try {
-        tc.vars.audioCtx.suspend();
-        if (tc.settings.debugMode) {
-            log(hasHooked
-                ? "audio context suspended (media paused) — device handle released"
-                : "audio context suspended (no hooked media) — device handle released", 4);
-        }
+        if (!element) return "";
+        if (element.srcObject) return "stream:" + String(element.srcObject.id || "");
+        return String(element.currentSrc || element.src || "");
     } catch (e) {
-        if (tc.settings.debugMode) log(`audio context suspend failed: ${e && e.message}`, 2);
+        return "";
     }
+}
+
+function resetEphemeralControlsForMediaBoundary(element) {
+    if (tc.vars.hasRememberedSettings || tc.vars.isBlocked || !element) return;
+    const previousElement = tc.vars.ephemeralActiveElement;
+    const previousSource = tc.vars.ephemeralSourceKeys.get(element) || "";
+    const currentSource = mediaSourceKey(element);
+    const pendingBoundary = tc.vars.ephemeralBoundaryPending.has(element);
+    const changedElement = Boolean(previousElement && previousElement !== element);
+    const changedSource = Boolean(previousSource && currentSource && previousSource !== currentSource);
+
+    if (previousElement && (changedElement || changedSource || pendingBoundary)) {
+        tc.vars.dB = 0;
+        tc.vars.mono = false;
+        tc.vars.muted = false;
+        lastSyncedPageAudioState = null;
+        applyState();
+        syncPageAudioHook();
+    }
+
+    tc.vars.ephemeralActiveElement = element;
+    tc.vars.ephemeralSourceKeys.set(element, currentSource);
+    tc.vars.ephemeralBoundaryPending.delete(element);
 }
 
 function registerMediaElement(element) {
@@ -1024,6 +1137,7 @@ function registerMediaElement(element) {
     element.dataset.vcWatched = "true";
 
     const hookIfPlaying = () => {
+        if (isMediaPlaying(element)) resetEphemeralControlsForMediaBoundary(element);
         if (isPageAudioManaged(element)) {
             if (element.dataset.vcFallback === 'true') clearFallbackVolume(element);
             return;
@@ -1059,7 +1173,13 @@ function registerMediaElement(element) {
         hookIfPlaying();
     }, { passive: true });
     // v6.14: a new source must re-earn its EME decryption proof.
-    element.addEventListener('emptied', () => resetEmePending(element), { passive: true });
+    element.addEventListener('emptied', () => {
+        resetEmePending(element);
+        tc.vars.ephemeralBoundaryPending.add(element);
+    }, { passive: true });
+    element.addEventListener('loadstart', () => {
+        if (tc.vars.ephemeralActiveElement === element) tc.vars.ephemeralBoundaryPending.add(element);
+    }, { passive: true });
     const scheduleSuspend = () => setTimeout(suspendAudioContextIfIdle, 250);
     for (const evt of ['pause', 'ended', 'emptied']) {
         element.addEventListener(evt, scheduleSuspend, { passive: true });
@@ -1075,9 +1195,20 @@ function connectOutput(element) {
     }
 
     if (element.dataset.vcHooked === "true") {
+        if (!tc.vars.audioCtx || tc.vars.audioCtx.state === 'closed') {
+            // A MediaElementAudioSource cannot be recreated on another context.
+            // Do not pretend the stale route is healthy or bind a new GainNode
+            // to the dead context. Surface the limitation until navigation
+            // replaces the element.
+            element.dataset.vcFallbackReason = "route-failed";
+            if (tc.vars.mediaElements) tc.vars.mediaElements.delete(element);
+            invalidateBoostLimitCache();
+            log("Previously hooked media lost its AudioContext; route is unavailable until the element is replaced", 2);
+            return;
+        }
         if (tc.vars.mediaElements) tc.vars.mediaElements.add(element);
-        if (isMediaPlaying(element) && tc.vars.audioCtx && tc.vars.audioCtx.state === 'suspended') {
-            tc.vars.audioCtx.resume().then(applyState);
+        if (isMediaPlaying(element) && tc.vars.audioCtx.state === 'suspended') {
+            resumeAudioContext();
         }
         return;
     }
@@ -1119,6 +1250,10 @@ function connectOutput(element) {
     }
 
     if (!tc.vars.audioCtx || tc.vars.audioCtx.state === 'closed') {
+        // A GainNode belongs to exactly one AudioContext. Clear the stale node
+        // before constructing a replacement context or connect() will throw a
+        // cross-context InvalidAccessError.
+        tc.vars.gainNode = undefined;
         // If the context was closed (e.g. the page itself called .close()
         // on it, or a previous extension version closed it), create a fresh
         // one. Note: any elements previously hooked on the old context have
@@ -1191,7 +1326,7 @@ function connectOutput(element) {
             // Wake up the AudioContext when media starts playing
             element.addEventListener('play', () => {
                 if (tc.vars.audioCtx && tc.vars.audioCtx.state === 'suspended') {
-                    tc.vars.audioCtx.resume().then(applyState);
+                    resumeAudioContext();
                 }
             });
 
@@ -1226,7 +1361,7 @@ function connectOutput(element) {
         }
 
     } catch (e) {
-        log(`connectOutput outer failure: ${e && e.message}`, 1);
+        log(`connectOutput outer failure: ${e && e.message}`, 2);
         applyFallbackVolume(element, "route-failed");
         if (tc.settings.debugMode) element.style.border = "5px solid red";
     }
@@ -1304,7 +1439,7 @@ function applyEffectiveDebugSettings(data, controlUrl) {
     tc.settings.debugRouteMode = normalizeDebugRouteMode(data.debugRouteMode);
 
     // A remembered site's optional debug object overrides those defaults only
-    // for URLs matched by the existing whitelist/memory lookup.
+    // for URLs matched by the existing remembered-profile lookup.
     const siteSettingsKey = getSiteSettingsKey(data.siteSettings || {}, controlUrl);
     const siteSettings = siteSettingsKey ? data.siteSettings[siteSettingsKey] : null;
     const siteDebug = siteSettings && siteSettings.debug && typeof siteSettings.debug === "object"
@@ -1340,7 +1475,7 @@ async function start() {
     const generation = ++startGeneration;
     controlProfileReady = false;
     try {
-        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {}, debugMode: false, forceDrmCapture: false, forceCorsCapture: false, debugRouteMode: "auto", legacyTwitchDefaultsPurged: false });
+        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, whitelistSeparatedV1: false, siteSettings: {}, debugMode: false, forceDrmCapture: false, forceCorsCapture: false, debugRouteMode: "auto", legacyTwitchDefaultsPurged: false });
         if (generation !== startGeneration) return;
 
         // One-time migration (issue #69): V4-era builds seeded default
@@ -1349,16 +1484,11 @@ async function start() {
         // v6.11's www-stripping normalization they matched the whole
         // twitch.tv site, silently deactivating the extension there.
         if (!data.legacyTwitchDefaultsPurged) {
+            // Apply the migration view locally so this page is never blocked by
+            // obsolete defaults. The background owns the actual serialized
+            // storage mutation, avoiding a content-script vs Options race.
             const purged = purgeLegacyDefaultBlocklist(data.fqdns || []);
             data.fqdns = purged.list;
-            try {
-                await storageSet(Object.assign(
-                    purged.changed ? { fqdns: purged.list } : {},
-                    { legacyTwitchDefaultsPurged: true }
-                ));
-            } catch (e) {
-                if (tc.settings.debugMode) log(`legacy blocklist purge failed: ${e && e.message}`, 2);
-            }
         }
 
         if (generation !== startGeneration) return;
@@ -1367,6 +1497,7 @@ async function start() {
         if (!isTopFrame() && controlUrl) profileControlUrl = controlUrl;
         const currentDomain = extractRootDomain(controlUrl);
         const siteSettingsKey = applyEffectiveDebugSettings(data, controlUrl);
+        tc.vars.hasRememberedSettings = Boolean(siteSettingsKey);
 
         // Debug: show state used to decide blocking
         if (tc.settings.debugMode) {
@@ -1375,10 +1506,14 @@ async function start() {
 
         let blocked = false;
         if (data.whitelistMode) {
-            // Whitelist is derived from remembered sites (siteSettings)
-            const remembered = Object.keys(data.siteSettings || {});
-            if (tc.settings.debugMode) log(`start(): remembered samples=[${remembered.slice(0,5).join(',')}]`, 4);
-            if (!siteSettingsKey) blocked = true;
+            // Whitelist authorization is independent from Remembered Settings.
+            // This lets users allow a site while keeping each tab/navigation at
+            // its own ephemeral 0 dB state (issue #72).
+            const explicitAllowed = (data.whitelist || []).some(entry => isUrlRememberedByEntry(controlUrl, entry));
+            const legacyAllowed = !data.whitelistSeparatedV1 && Boolean(siteSettingsKey);
+            const allowed = explicitAllowed || legacyAllowed;
+            if (tc.settings.debugMode) log(`start(): whitelist samples=[${(data.whitelist || []).slice(0,5).join(',')}]`, 4);
+            if (!allowed) blocked = true;
         } else {
             // Path-aware matching (issue #69): legacy path entries like
             // "www.twitch.tv/*/clip/*" scope to their path and no longer
@@ -1392,24 +1527,37 @@ async function start() {
         // Ensure the content script's blocked flag reflects the current state (clear it when unblocked)
         tc.vars.isBlocked = blocked;
         controlProfileReady = true;
-        if (!isTopFrame()) reportFrameBoostLimit();
         if (blocked) {
-            applyState();
-            ensurePageBridgeResync();
-            ensurePageBridgeHeartbeat();
+            // Resolve the MAIN-world preflight immediately. This sends an
+            // authenticated disabled state, causing it to restore native page
+            // APIs instead of leaving wrappers installed on an excluded site.
+            lastSyncedPageAudioState = null;
+            syncPageAudioHook();
+            stopPageBridgeTimers();
+            stopFrameReporting();
+            stopBoostLimitObserver();
             return;
         }
+
+        setupBoostLimitObserver();
+        startFrameReporting();
 
         if (siteSettingsKey) {
             const s = data.siteSettings[siteSettingsKey];
             if (s.volume !== undefined) tc.vars.dB = normalizeDb(s.volume);
             if (s.mono !== undefined) tc.vars.mono = s.mono;
-            // Restore the remembered mute too: "muted" is persisted as part of
-            // the remembered triple (and re-applied when the popup opens), so
-            // leaving it out here meant a remembered-muted site audibly played
-            // after every navigation until the popup happened to be opened.
             if (s.muted !== undefined) tc.vars.muted = Boolean(s.muted);
+        } else if (lastResolvedControlUrl && controlUrl && controlUrl !== lastResolvedControlUrl) {
+            // "Remember" off means the control state is ephemeral. Reset when
+            // an SPA moves to a new video/page instead of carrying the previous
+            // video's dB/mute/mono state forward. Separate tabs already have
+            // separate content-script state; this also gives issue #72 the
+            // expected new-video default on URL-changing players such as YouTube.
+            tc.vars.dB = 0;
+            tc.vars.mono = false;
+            tc.vars.muted = false;
         }
+        lastResolvedControlUrl = controlUrl;
 
         applyState();
         ensurePageBridgeResync();
@@ -1420,7 +1568,6 @@ async function start() {
     }
 }
 
-setupBoostLimitObserver();
 start();
 
 // Listen for requests from the page-audio hook (e.g., when it reactivates
@@ -1429,10 +1576,13 @@ window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const data = event.data;
     if (!data || data.source !== PAGE_BRIDGE_TARGET || data.target !== PAGE_BRIDGE_SOURCE) return;
+    if (data.token !== PAGE_BRIDGE_TOKEN) return;
 
     if (data.command === "locationChanged") {
         if (isTopFrame()) {
-            profileControlUrl = typeof data.href === "string" && data.href ? data.href : window.location.href;
+            // Never trust a URL supplied by MAIN-world page code. The current
+            // document URL is authoritative and cannot be forged by postMessage.
+            profileControlUrl = window.location.href;
             start();
             runtimeSendMessage({ command: "topUrlChanged", url: profileControlUrl }).catch(() => {});
         }
@@ -1444,6 +1594,7 @@ window.addEventListener("message", (event) => {
     // verdict so the next state query reflects it immediately.
     if (data.command === "pageRestrictionChanged") {
         invalidateBoostLimitCache();
+        if (!isTopFrame()) reportFrameBoostLimit(true);
         return;
     }
 
@@ -1467,6 +1618,8 @@ if (browserAPI && browserAPI.storage && browserAPI.storage.onChanged) {
         // change must not overwrite a remembered site's explicit override.
         if (
             changes.whitelistMode ||
+            changes.whitelistSeparatedV1 ||
+            changes.whitelist ||
             changes.fqdns ||
             changes.siteSettings ||
             changes.debugMode ||
