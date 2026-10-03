@@ -11,9 +11,9 @@ const {
     callApi
 } = globalThis.VolumeControlShared;
 
-// debounce timer for memory list rendering to avoid double-renders when storage changes
+// debounce timers for list rendering to avoid double-renders when storage changes
 let memoryListRenderTimeout = null;
-// debounce for fqdn list updates
+let debugListRenderTimeout = null;
 let fqdnListRenderTimeout = null;
 
 function mutateSiteSettings(mutation) {
@@ -22,6 +22,10 @@ function mutateSiteSettings(mutation) {
 
 function mutateAccessLists(mutation) {
     return runtimeSendMessage({ command: "mutateAccessLists", mutation });
+}
+
+function mutateSiteDebugSettings(mutation) {
+    return runtimeSendMessage({ command: "mutateSiteDebugSettings", mutation });
 }
 
 function normalizeDebugRouteMode(value) {
@@ -37,7 +41,7 @@ function normalizeSiteDebugOverrides(value = {}) {
     };
 }
 
-function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename, globalDebugSettings = {}) {
+function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
     const entry = document.createElement('div');
     entry.className = 'list-entry';
 
@@ -50,7 +54,7 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename, globa
 
     // Commit rename on blur or Enter
     const commitRename = async () => {
-        const newName = normalizeSiteSettingsEntryInput(info.value);
+        const newName = normalizeSiteSettingsEntryInput(info.value, { includeQuery: true });
         if (!newName) {
             alert('Site cannot be empty.');
             info.value = domain;
@@ -150,30 +154,55 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename, globa
 
     controls.appendChild(settingGroup);
 
-    // Optional per-site debug override. When disabled, this remembered site
-    // inherits the global debug defaults below. Enabling it snapshots the
-    // currently displayed effective values so behavior does not change just
-    // because the override was turned on.
-    const savedDebug = settings && settings.debug && typeof settings.debug === 'object'
-        ? normalizeSiteDebugOverrides(settings.debug)
-        : null;
-    const inheritedDebug = normalizeSiteDebugOverrides(globalDebugSettings);
-    const effectiveDebug = savedDebug || inheritedDebug;
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove-btn';
+    removeBtn.title = 'Remove remembered settings';
+    removeBtn.textContent = '×';
+    removeBtn.addEventListener('click', () => onRemove(domain));
 
+    controls.appendChild(removeBtn);
+
+    entry.appendChild(info);
+    entry.appendChild(controls);
+
+    return entry;
+}
+
+function createDebugEntry(domain, settings, onRemove, onUpdate, onRename) {
+    const entry = document.createElement('div');
+    entry.className = 'list-entry';
+
+    const info = document.createElement('input');
+    info.type = 'text';
+    info.className = 'domain-input';
+    info.value = domain;
+    info.title = 'Edit site debug override';
+    info.setAttribute('aria-label', 'Edit site debug override');
+
+    const commitRename = async () => {
+        const newName = normalizeSiteSettingsEntryInput(info.value, { includeQuery: true });
+        if (!newName) {
+            alert('Site cannot be empty.');
+            info.value = domain;
+            info.focus();
+            return;
+        }
+        if (newName === domain) {
+            info.value = domain;
+            return;
+        }
+        if (typeof onRename === 'function') await onRename(domain, newName);
+    };
+    info.addEventListener('blur', commitRename);
+    info.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') info.blur();
+    });
+
+    const controls = document.createElement('div');
+    controls.className = 'controls-container';
     const debugGroup = document.createElement('div');
     debugGroup.className = 'setting-group site-debug-group';
-
-    const perSiteLabel = document.createElement('label');
-    perSiteLabel.className = 'mono-label site-debug-enable';
-    perSiteLabel.title = 'Override the global debug options for this remembered site';
-    const perSiteCheckbox = document.createElement('input');
-    perSiteCheckbox.type = 'checkbox';
-    perSiteCheckbox.checked = Boolean(savedDebug);
-    perSiteLabel.appendChild(perSiteCheckbox);
-    const perSiteText = document.createElement('span');
-    perSiteText.textContent = 'Site debug';
-    perSiteLabel.appendChild(perSiteText);
-    debugGroup.appendChild(perSiteLabel);
+    const normalized = normalizeSiteDebugOverrides(settings);
 
     function makeDebugCheckbox(text, checked, title) {
         const label = document.createElement('label');
@@ -192,17 +221,17 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename, globa
 
     const debugHighlightCheckbox = makeDebugCheckbox(
         'Highlight',
-        effectiveDebug.debugMode,
+        normalized.debugMode,
         'Show debug borders on media elements for this site'
     );
     const drmCheckbox = makeDebugCheckbox(
         'DRM',
-        effectiveDebug.forceDrmCapture,
+        normalized.forceDrmCapture,
         'Force DRM/EME audio capture for this site (dangerous)'
     );
     const corsCheckbox = makeDebugCheckbox(
         'CORS',
-        effectiveDebug.forceCorsCapture,
+        normalized.forceCorsCapture,
         'Skip the cross-origin media guard for this site (dangerous)'
     );
 
@@ -219,58 +248,41 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename, globa
         option.textContent = label;
         routeSelect.appendChild(option);
     }
-    routeSelect.value = effectiveDebug.debugRouteMode;
+    routeSelect.value = normalized.debugRouteMode;
     debugGroup.appendChild(routeSelect);
 
-    const debugInputs = [debugHighlightCheckbox, drmCheckbox, corsCheckbox, routeSelect];
-    const updateDebugEnabledState = () => {
-        for (const input of debugInputs) input.disabled = !perSiteCheckbox.checked;
-        debugGroup.classList.toggle('is-inherited', !perSiteCheckbox.checked);
+    const commit = () => {
+        onUpdate(domain, normalizeSiteDebugOverrides({
+            debugMode: debugHighlightCheckbox.checked,
+            forceDrmCapture: drmCheckbox.checked,
+            forceCorsCapture: corsCheckbox.checked,
+            debugRouteMode: routeSelect.value
+        }));
     };
-    const commitDebug = () => {
-        if (!perSiteCheckbox.checked) {
-            onUpdate(domain, { debug: null });
-            return;
-        }
-        onUpdate(domain, {
-            debug: normalizeSiteDebugOverrides({
-                debugMode: debugHighlightCheckbox.checked,
-                forceDrmCapture: drmCheckbox.checked,
-                forceCorsCapture: corsCheckbox.checked,
-                debugRouteMode: routeSelect.value
-            })
-        });
-    };
-
-    perSiteCheckbox.addEventListener('change', () => {
-        updateDebugEnabledState();
-        commitDebug();
-    });
-    debugHighlightCheckbox.addEventListener('change', commitDebug);
-    drmCheckbox.addEventListener('change', commitDebug);
-    corsCheckbox.addEventListener('change', commitDebug);
-    routeSelect.addEventListener('change', commitDebug);
-    updateDebugEnabledState();
+    debugHighlightCheckbox.addEventListener('change', commit);
+    drmCheckbox.addEventListener('change', commit);
+    corsCheckbox.addEventListener('change', commit);
+    routeSelect.addEventListener('change', commit);
 
     controls.appendChild(debugGroup);
 
     const removeBtn = document.createElement('button');
     removeBtn.className = 'remove-btn';
-    removeBtn.title = 'Remove remembered settings';
+    removeBtn.title = 'Remove site debug override';
     removeBtn.textContent = '×';
     removeBtn.addEventListener('click', () => onRemove(domain));
-
     controls.appendChild(removeBtn);
 
     entry.appendChild(info);
     entry.appendChild(controls);
-
     return entry;
 }
 
 let memoryListRendering = false;
+let debugListRendering = false;
 let fqdnListRendering = false;
 let memoryListRenderPending = false;
+let debugListRenderPending = false;
 let fqdnListRenderPending = false;
 
 async function renderMemoryList() {
@@ -287,15 +299,8 @@ async function renderMemoryList() {
         }
         container.innerHTML = '';
 
-        const data = await storageGet({
-            siteSettings: {},
-            debugMode: false,
-            forceDrmCapture: false,
-            forceCorsCapture: false,
-            debugRouteMode: 'auto'
-        });
+        const data = await storageGet({ siteSettings: {} });
         const settings = data.siteSettings || {};
-        const globalDebugSettings = normalizeSiteDebugOverrides(data);
         const domains = Object.keys(settings).sort((a, b) => a.localeCompare(b));
 
         if (domains.length === 0) {
@@ -313,9 +318,6 @@ async function renderMemoryList() {
                 if (newVal.volume !== undefined) patch.volume = normalizeDb(newVal.volume);
                 if (newVal.mono !== undefined) patch.mono = !!newVal.mono;
                 if (newVal.muted !== undefined) patch.muted = !!newVal.muted;
-                if (Object.prototype.hasOwnProperty.call(newVal, 'debug')) {
-                    patch.debug = newVal.debug ? normalizeSiteDebugOverrides(newVal.debug) : null;
-                }
                 await mutateSiteSettings({ type: "merge", key: domain, patch });
             }, async (oldDomain, newDomain) => {
                 const nd = normalizeSiteSettingsEntryInput(newDomain);
@@ -326,7 +328,7 @@ async function renderMemoryList() {
                 if (nd === oldDomain) return;
                 const result = await mutateSiteSettings({ type: "rename", key: oldDomain, newKey: nd });
                 if (result && result.reason === "exists") alert('A remembered entry for that site/path already exists.');
-            }, globalDebugSettings);
+            });
 
             container.appendChild(entry);
         }
@@ -337,6 +339,72 @@ async function renderMemoryList() {
         if (memoryListRenderPending) {
             memoryListRenderPending = false;
             queueMicrotask(() => renderMemoryList());
+        }
+    }
+}
+
+async function renderDebugList() {
+    if (debugListRendering) {
+        debugListRenderPending = true;
+        return;
+    }
+    debugListRendering = true;
+    try {
+        const container = document.getElementById('debugList');
+        if (!container) return;
+        container.innerHTML = '';
+
+        const data = await storageGet({
+            siteDebugSettings: {},
+            siteDebugSettingsSeparatedV1: false,
+            siteSettings: {}
+        });
+        const settings = { ...(data.siteDebugSettings || {}) };
+
+        // Seamless migration view: expose legacy embedded overrides until the
+        // serialized background migration commits the separated store.
+        if (!data.siteDebugSettingsSeparatedV1) {
+            for (const [key, value] of Object.entries(data.siteSettings || {})) {
+                if (!Object.prototype.hasOwnProperty.call(settings, key) &&
+                    value && value.debug && typeof value.debug === 'object') {
+                    settings[key] = normalizeSiteDebugOverrides(value.debug);
+                }
+            }
+        }
+
+        const domains = Object.keys(settings).sort((a, b) => a.localeCompare(b));
+        if (!domains.length) {
+            const empty = document.createElement('div');
+            empty.className = 'empty-msg';
+            empty.textContent = 'No site debug overrides';
+            container.appendChild(empty);
+            return;
+        }
+
+        for (const domain of domains) {
+            const entry = createDebugEntry(domain, settings[domain], async (key) => {
+                await mutateSiteDebugSettings({ type: "remove", key });
+            }, async (key, value) => {
+                await mutateSiteDebugSettings({ type: "merge", key, patch: value });
+            }, async (oldKey, newKey) => {
+                const result = await mutateSiteDebugSettings({
+                    type: "rename",
+                    key: oldKey,
+                    newKey
+                });
+                if (result && result.reason === "exists") {
+                    alert('A debug override for that site/path already exists.');
+                }
+            });
+            container.appendChild(entry);
+        }
+    } catch (e) {
+        console.error('Options: renderDebugList error', e);
+    } finally {
+        debugListRendering = false;
+        if (debugListRenderPending) {
+            debugListRenderPending = false;
+            queueMicrotask(() => renderDebugList());
         }
     }
 }
@@ -403,7 +471,27 @@ async function renderFqdnList() {
     }
 }
 
-// Render the list of keyboard shortcuts using chrome.commands.getAll().
+function isFirefoxBrowser() {
+    return Boolean(browserApi && browserApi.runtime &&
+        typeof browserApi.runtime.getURL === 'function' &&
+        browserApi.runtime.getURL('').indexOf('moz-extension://') === 0);
+}
+
+function getSuggestedShortcut(commandName) {
+    if (!browserApi || !browserApi.runtime || typeof browserApi.runtime.getManifest !== 'function') return '';
+    try {
+        const manifest = browserApi.runtime.getManifest();
+        const suggested = manifest && manifest.commands && manifest.commands[commandName] &&
+            manifest.commands[commandName].suggested_key;
+        return suggested && (suggested.default || suggested.mac || suggested.windows || suggested.linux || suggested.chromeos)
+            ? (suggested.default || suggested.mac || suggested.windows || suggested.linux || suggested.chromeos)
+            : '';
+    } catch (e) {
+        return '';
+    }
+}
+
+// Render the list of keyboard shortcuts using commands.getAll().
 // Each row shows the action description and the current key combo as keycaps.
 async function renderShortcuts() {
     const container = document.getElementById('shortcutsList');
@@ -468,7 +556,8 @@ async function renderShortcuts() {
         } else {
             const unset = document.createElement('span');
             unset.className = 'shortcut-unset';
-            unset.textContent = 'Not set';
+            const suggested = getSuggestedShortcut(cmd.name);
+            unset.textContent = suggested ? `Not set — suggested: ${suggested}` : 'Not set';
             keys.appendChild(unset);
         }
 
@@ -478,21 +567,50 @@ async function renderShortcuts() {
     }
 }
 
-// Open the browser's keyboard shortcut customization page.
-// Chrome/Edge: chrome://extensions/shortcuts
-// Firefox: about:addons/shortcuts (Firefox 89+)
-function openShortcutsPage() {
-    if (!browserApi || !browserApi.tabs || typeof browserApi.tabs.create !== 'function') {
+// Open the browser's keyboard shortcut customization page. Firefox exposes a
+// dedicated API; Chromium requires opening chrome://extensions/shortcuts.
+async function openShortcutsPage() {
+    try {
+        if (isFirefoxBrowser() &&
+            browserApi.commands &&
+            typeof browserApi.commands.openShortcutSettings === 'function') {
+            await browserApi.commands.openShortcutSettings();
+            return;
+        }
+        if (!browserApi || !browserApi.tabs || typeof browserApi.tabs.create !== 'function') {
+            throw new Error('tabs.create is unavailable');
+        }
+        await callApi(browserApi.tabs.create.bind(browserApi.tabs), [{ url: 'chrome://extensions/shortcuts' }]);
+    } catch (err) {
+        console.error('Options: failed to open shortcuts page', err);
         alert('Could not open the shortcut settings page automatically. Please open your browser\'s extension shortcut settings manually.');
-        return;
     }
-    const isFirefox = browserApi.runtime.getURL('').indexOf('moz-extension://') === 0;
-    const url = isFirefox ? 'about:addons/shortcuts' : 'chrome://extensions/shortcuts';
-    callApi(browserApi.tabs.create.bind(browserApi.tabs), [{ url }])
-        .catch(err => {
-            console.error('Options: failed to open shortcuts page', err);
-            alert('Could not open the shortcut settings page automatically. Please open your browser\'s extension shortcut settings manually.');
-        });
+}
+
+async function restoreShortcutDefaults() {
+    if (!isFirefoxBrowser() || !browserApi.commands || typeof browserApi.commands.reset !== 'function') return;
+    const button = document.getElementById('restoreShortcutDefaults');
+    if (button) {
+        button.disabled = true;
+        button.textContent = 'Restoring...';
+    }
+    try {
+        const commands = await callApi(browserApi.commands.getAll.bind(browserApi.commands), []);
+        for (const cmd of commands || []) {
+            if (cmd && cmd.name) {
+                await callApi(browserApi.commands.reset.bind(browserApi.commands), [cmd.name]);
+            }
+        }
+        await renderShortcuts();
+    } catch (e) {
+        console.error('Options: commands.reset failed', e);
+        alert('Could not restore the default shortcuts.');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = 'Restore Default Shortcuts';
+        }
+    }
 }
 
 async function initOptions() {
@@ -590,7 +708,7 @@ async function initOptions() {
             // Blocklist paths use exclusion semantics; whitelist paths use
             // explicit allow-list matching independent from remembered audio.
             const v = data.whitelistMode
-                ? normalizeSiteSettingsEntryInput(newFqdnInput.value)
+                ? normalizeSiteSettingsEntryInput(newFqdnInput.value, { includeQuery: true })
                 : normalizeBlocklistEntryInput(newFqdnInput.value);
             if (!v) return;
             if (data.whitelistMode) {
@@ -627,7 +745,7 @@ async function initOptions() {
     const newRememberedInput = document.getElementById('newRememberedSite');
     if (addRememberedBtn && newRememberedInput) {
         addRememberedBtn.addEventListener('click', async () => {
-            const v = normalizeSiteSettingsEntryInput(newRememberedInput.value);
+            const v = normalizeSiteSettingsEntryInput(newRememberedInput.value, { includeQuery: true });
             if (!v) return;
             const result = await mutateSiteSettings({
                 type: "create",
@@ -645,23 +763,64 @@ async function initOptions() {
         });
     }
 
-    // Keyboard shortcuts: wire up the button and render the current shortcuts.
+    // Site debug overrides are intentionally independent from Remembered Audio.
+    const addDebugSiteBtn = document.getElementById('addDebugSite');
+    const newDebugSiteInput = document.getElementById('newDebugSite');
+    if (addDebugSiteBtn && newDebugSiteInput) {
+        addDebugSiteBtn.addEventListener('click', async () => {
+            const key = normalizeSiteSettingsEntryInput(newDebugSiteInput.value, { includeQuery: true });
+            if (!key) return;
+            const defaults = await storageGet({
+                debugMode: false,
+                forceDrmCapture: false,
+                forceCorsCapture: false,
+                debugRouteMode: 'auto'
+            });
+            const result = await mutateSiteDebugSettings({
+                type: "create",
+                key,
+                value: normalizeSiteDebugOverrides(defaults)
+            });
+            if (!result || !result.ok) {
+                alert('A debug override for that site/path already exists.');
+                return;
+            }
+            newDebugSiteInput.value = '';
+        });
+        newDebugSiteInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addDebugSiteBtn.click();
+        });
+    }
+
+    // Keyboard shortcuts: wire up browser settings and Firefox's reset API.
     const openShortcutsBtn = document.getElementById('openShortcutsPage');
     if (openShortcutsBtn) {
         openShortcutsBtn.addEventListener('click', openShortcutsPage);
     }
+    const restoreShortcutDefaultsBtn = document.getElementById('restoreShortcutDefaults');
+    if (restoreShortcutDefaultsBtn &&
+        isFirefoxBrowser() &&
+        browserApi.commands &&
+        typeof browserApi.commands.reset === 'function') {
+        restoreShortcutDefaultsBtn.hidden = false;
+        restoreShortcutDefaultsBtn.addEventListener('click', restoreShortcutDefaults);
+    }
     await renderShortcuts();
 
-    // Refresh the shortcuts list when the user customizes them in another tab
-    // (chrome.commands.onChanged fires for the extension globally).
+    // Firefox exposes commands.onChanged; Chromium does not. Refresh again
+    // whenever this options tab becomes visible/focused after the browser's
+    // shortcut page was used.
     if (browserApi && browserApi.commands && browserApi.commands.onChanged) {
-        browserApi.commands.onChanged.addListener(() => {
-            renderShortcuts();
-        });
+        browserApi.commands.onChanged.addListener(() => renderShortcuts());
     }
+    window.addEventListener('focus', () => renderShortcuts());
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') renderShortcuts();
+    });
 
     await renderFqdnList();
     await renderMemoryList();
+    await renderDebugList();
 
     // When storage changes elsewhere, update UI (debounced for siteSettings)
     browserApi.storage.onChanged.addListener((changes, area) => {
@@ -677,6 +836,13 @@ async function initOptions() {
             fqdnListRenderTimeout = setTimeout(() => {
                 renderFqdnList();
                 fqdnListRenderTimeout = null;
+            }, 50);
+        }
+        if (changes.siteDebugSettings || changes.siteDebugSettingsSeparatedV1) {
+            if (debugListRenderTimeout) clearTimeout(debugListRenderTimeout);
+            debugListRenderTimeout = setTimeout(() => {
+                renderDebugList();
+                debugListRenderTimeout = null;
             }, 50);
         }
         if (changes.whitelistMode && whitelistModeCheckbox) {
@@ -704,15 +870,6 @@ async function initOptions() {
             debugRouteModeSelect.value = normalizeDebugRouteMode(changes.debugRouteMode.newValue);
         }
 
-        // Remembered rows that do not have a per-site override display the
-        // current global values in a disabled state, so keep them live too.
-        if (changes.debugMode || changes.forceDrmCapture || changes.forceCorsCapture || changes.debugRouteMode) {
-            if (memoryListRenderTimeout) clearTimeout(memoryListRenderTimeout);
-            memoryListRenderTimeout = setTimeout(() => {
-                renderMemoryList();
-                memoryListRenderTimeout = null;
-            }, 50);
-        }
     });
 }
 

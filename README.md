@@ -493,7 +493,18 @@ Create Firefox and Chrome zip packages:
 .\scripts\build.ps1
 ```
 
-The script writes clean packages to `dist/`, using `ico.svg` for Firefox and `chrome.png` for Chrome. Release copies are minified with **Terser 5.51.2** for JavaScript, **clean-css 5.3.3** for CSS, and **html-minifier-terser 7.2.0** for HTML. The source files are never rewritten by the build, and the bundled zips exclude repo files and `README.md`. `.github/workflows/ci.yml` runs the same regression/build path on Windows for pushes and pull requests, including a real headless Chromium lifecycle smoke test. Downloadable packages are published by the daily prerelease workflow when releasable code changes are detected.
+The script writes clean packages to `dist/`, using `ico.svg` for Firefox and `chrome.png` for Chrome. Release copies are minified with **Terser 5.51.2** for JavaScript, **clean-css 5.3.3** for CSS, and **html-minifier-terser 7.2.0** for HTML. The source files are never rewritten by the build, and the bundled zips exclude repo files and `README.md`. `.github/workflows/ci.yml` runs regression tests, builds first, and then runs the real Chromium and Firefox audio-hook smoke tests against the actual minified files in `dist/chrome` and `dist/firefox`. Downloadable packages are published by the daily prerelease workflow when releasable code changes are detected.
+
+### Stable Firefox / AMO publishing
+
+Publishing a **non-prerelease GitHub Release** runs `.github/workflows/publish-firefox.yml`. The workflow checks out the exact stable tag, reruns regression tests, rebuilds the extension, extracts the generated Firefox ZIP, runs both hook-level and temporary-installed-addon smoke tests against that extracted release artifact, creates a readable source archive for Mozilla review, validates the upload with AMO's v5 API, and submits the listed version with the **ISC** license.
+
+Configure these repository Actions secrets before publishing a stable release:
+
+- `AMO_JWT_ISSUER` — the AMO API key/issuer.
+- `AMO_JWT_SECRET` — the matching AMO API secret.
+
+If the secrets are absent, the workflow still verifies the release build but skips the AMO submission instead of failing the release. Manual **workflow_dispatch** runs require an exact stable tag such as `V6.23` and default to **validation only**; `publish=true` must be selected explicitly to submit to AMO. Before uploading, the workflow checks authenticated AMO version history so a version already public, pending review, or otherwise already present is not submitted again.
 
 ***
 
