@@ -12,6 +12,8 @@ const {
     purgeLegacyDefaultBlocklist,
     getSiteSettingsKey,
     BRIDGE_VERSION,
+    DEFAULT_NORMALIZER_CONFIG,
+    normalizeNormalizerConfig,
     BOOST_LIMIT_NOTE
 } = globalThis.VolumeControlShared;
 const sharedExtractRootDomain = globalThis.VolumeControlShared.extractRootDomain;
@@ -41,7 +43,7 @@ const BOOST_LIMIT_NOTES = {
 let pageBridgeResyncInterval = null;
 let controlProfileReady = false;
 let profileControlUrl = "";
-let lastResolvedControlUrl = "";
+
 let startGeneration = 0;
 
 const tc = {
@@ -50,14 +52,25 @@ const tc = {
     debugMode: false,
     forceDrmCapture: false,
     forceCorsCapture: false,
-    debugRouteMode: "auto"
+    debugRouteMode: "auto",
+    normalizerConfig: normalizeNormalizerConfig(DEFAULT_NORMALIZER_CONFIG)
   },
   vars: {
     dB: 0,
     mono: false,
     muted: false,
+    normalizerEnabled: false,
+    normalizerPeakDb: -Infinity,
+    normalizerGainDb: 0,
+    isolatedOutputUsesLimiter: null,
     audioCtx: undefined,
     gainNode: undefined,
+    inputAnalyserNode: undefined,
+    inputAnalyserBuffer: undefined,
+    limiterNode: undefined,
+    analyserNode: undefined,
+    analyserBuffer: undefined,
+    normalizerTimer: null,
     isBlocked: false,
     pendingInit: false,
     // Media elements successfully hooked into our AudioContext (source.connect'd).
@@ -67,10 +80,7 @@ const tc = {
     // querySelectorAll on every state change.
     knownMediaElements: new Set(),
     audioSuspendPromise: null,
-    hasRememberedSettings: false,
-    ephemeralActiveElement: null,
-    ephemeralSourceKeys: new WeakMap(),
-    ephemeralBoundaryPending: new WeakSet()
+
   }
 };
 
@@ -128,6 +138,29 @@ if (browserAPI) {
                 applyState();
                 sendResponse({});
                 break;
+            case "setNormalizer":
+                if (tc.vars.normalizerEnabled !== Boolean(msg.enabled)) {
+                    // A previous song may have accumulated +12 dB auto gain.
+                    // Never replay it immediately when normalization resumes.
+                    tc.vars.normalizerGainDb = 0;
+                    tc.vars.normalizerPeakDb = -Infinity;
+                }
+                tc.vars.normalizerEnabled = Boolean(msg.enabled);
+                lastSyncedPageAudioState = null;
+                applyState();
+                sendResponse({ response: getAudioControlState() });
+                break;
+            case "getMeterState":
+                sendResponse({
+                    response: {
+                        normalizerEnabled: Boolean(tc.vars.normalizerEnabled),
+                        normalizerAvailable: getNormalizerAvailability().available,
+                        normalizerUnavailableReason: getNormalizerAvailability().reason,
+                        peakDb: Number.isFinite(tc.vars.normalizerPeakDb) ? tc.vars.normalizerPeakDb : -Infinity,
+                        normalizerGainDb: Number.isFinite(tc.vars.normalizerGainDb) ? tc.vars.normalizerGainDb : 0
+                    }
+                });
+                break;
             case "getMono":
                 sendResponse({ response: tc.vars.mono });
                 break;
@@ -166,7 +199,7 @@ function needsAudioRoute() {
     if (tc.vars.isBlocked) return false;
     if (tc.settings.debugRouteMode === "native") return false;
     if (tc.settings.debugRouteMode === "webaudio") return true;
-    return tc.vars.muted || tc.vars.mono || getGainValue(tc.vars.dB) > 1;
+    return tc.vars.muted || tc.vars.mono || tc.vars.normalizerEnabled || getGainValue(tc.vars.dB) > 1;
 }
 
 function getMediaSourceUrl(element) {
@@ -695,16 +728,32 @@ function getMonoAvailability(limit = getBoostLimitInfo()) {
     return { available: true, reason: "" };
 }
 
+function getNormalizerAvailability(limit = getBoostLimitInfo()) {
+    if (tc.settings.debugRouteMode === "native") {
+        return { available: false, reason: "native-route" };
+    }
+    if (limit && limit.boostLimited) {
+        return { available: false, reason: limit.reason || "fallback" };
+    }
+    return { available: true, reason: "" };
+}
+
 function getAudioControlState() {
     enforceBoostLimit({ sync: true });
     const limit = getBoostLimitInfo();
     const monoAvailability = getMonoAvailability(limit);
+    const normalizerAvailability = getNormalizerAvailability(limit);
     return {
         volume: Math.min(normalizeDb(tc.vars.dB), limit.maxDb),
         mono: tc.vars.mono,
         monoAvailable: monoAvailability.available,
         monoUnavailableReason: monoAvailability.reason,
         muted: Boolean(tc.vars.muted),
+        normalizerEnabled: Boolean(tc.vars.normalizerEnabled),
+        normalizerAvailable: normalizerAvailability.available,
+        normalizerUnavailableReason: normalizerAvailability.reason,
+        peakDb: Number.isFinite(tc.vars.normalizerPeakDb) ? tc.vars.normalizerPeakDb : -Infinity,
+        normalizerGainDb: Number.isFinite(tc.vars.normalizerGainDb) ? tc.vars.normalizerGainDb : 0,
         boostLimited: limit.boostLimited,
         maxDb: limit.maxDb,
         limitationReason: limit.reason,
@@ -761,7 +810,9 @@ function applyFallbackVolume(element, reason = "") {
         // Bluetooth headphones that stay active while a media element plays).
         // We still restore __vc_originalVolume below so unmuting is clean.
         if (tc.vars.muted) {
-            if (element.dataset.vcNativeMuted !== 'true') {
+            // Only claim ownership when we actually change the native mute.
+            // A site-muted element must stay muted when Volume Control unmutes.
+            if (element.dataset.vcNativeMuted !== 'true' && !element.muted) {
                 element.muted = true;
                 element.dataset.vcNativeMuted = 'true';
             }
@@ -822,6 +873,8 @@ function syncPageAudioHook() {
         dB: tc.vars.isBlocked ? 0 : normalizeDb(tc.vars.dB),
         mono: !tc.vars.isBlocked && tc.vars.mono,
         muted: !tc.vars.isBlocked && Boolean(tc.vars.muted),
+        normalizerEnabled: !tc.vars.isBlocked && Boolean(tc.vars.normalizerEnabled),
+        normalizerConfig: tc.settings.normalizerConfig,
         debugMode: tc.settings.debugMode,
         forceDrmCapture: tc.settings.forceDrmCapture,
         forceCorsCapture: tc.settings.forceCorsCapture,
@@ -834,6 +887,8 @@ function syncPageAudioHook() {
         lastSyncedPageAudioState.dB === currentState.dB &&
         lastSyncedPageAudioState.mono === currentState.mono &&
         lastSyncedPageAudioState.muted === currentState.muted &&
+        lastSyncedPageAudioState.normalizerEnabled === currentState.normalizerEnabled &&
+        JSON.stringify(lastSyncedPageAudioState.normalizerConfig) === JSON.stringify(currentState.normalizerConfig) &&
         lastSyncedPageAudioState.debugMode === currentState.debugMode &&
         lastSyncedPageAudioState.forceDrmCapture === currentState.forceDrmCapture &&
         lastSyncedPageAudioState.forceCorsCapture === currentState.forceCorsCapture &&
@@ -877,6 +932,75 @@ function sendPageAudioHeartbeat() {
     }
 }
 
+function routeIsolatedOutput() {
+    const { audioCtx, gainNode, limiterNode, analyserNode } = tc.vars;
+    if (!audioCtx || !gainNode || !limiterNode || !analyserNode) return;
+    const useLimiter = !tc.vars.isBlocked &&
+        (tc.vars.normalizerEnabled || (!tc.vars.muted && tc.vars.dB > 0));
+    if (tc.vars.isolatedOutputUsesLimiter === useLimiter) return;
+
+    if (!useLimiter) {
+        // Disabling Normalize or positive boost can remove the compressor.
+        // Clamp the active (possibly boosted) AudioParam BEFORE connecting
+        // directly to the destination; the later 15ms UI ramp is too late.
+        try {
+            const param = gainNode.gain;
+            const now = audioCtx.currentTime;
+            const safeGain = tc.vars.isBlocked ? 1 :
+                (tc.vars.muted ? 0 : Math.max(0, Math.min(1, getGainValue(tc.vars.dB))));
+            param.cancelScheduledValues(now);
+            param.setValueAtTime(safeGain, now);
+        } catch (e) {
+            if (tc.settings.debugMode) log(`isolated direct route safety clamp failed: ${e && e.message}`, 3);
+            // Keep existing limited audio connected rather than allowing an
+            // uncontrolled gain burst through an unprotected direct path.
+            return;
+        }
+    }
+
+    // Disconnect only outgoing edges: media element source -> gain remains
+    // intact, even while a player is actively playing.
+    for (const node of [gainNode, limiterNode, analyserNode]) {
+        try { node.disconnect(); } catch (e) {}
+    }
+    try {
+        if (useLimiter) {
+            configureIsolatedLimiter();
+            gainNode.connect(limiterNode);
+            limiterNode.connect(analyserNode);
+            analyserNode.connect(audioCtx.destination);
+        } else {
+            gainNode.connect(audioCtx.destination);
+        }
+        tc.vars.isolatedOutputUsesLimiter = useLimiter;
+    } catch (e) {
+        // A partial rebuild must not leave captured media permanently silent.
+        // Discard partial edges and attempt a direct, gain-limited fallback.
+        tc.vars.isolatedOutputUsesLimiter = null;
+        tc.vars.normalizerGainDb = 0;
+        tc.vars.normalizerPeakDb = -Infinity;
+        for (const node of [gainNode, limiterNode, analyserNode]) {
+            try { node.disconnect(); } catch (_) {}
+        }
+        try {
+            // Clamp the existing AudioParam BEFORE reconnecting directly.
+            // A 15ms ramp in applyState() is too late: a previously boosted
+            // gain could otherwise play briefly without limiter protection.
+            const gainParam = gainNode.gain;
+            const now = audioCtx.currentTime;
+            gainParam.cancelScheduledValues(now);
+            gainParam.setValueAtTime(
+                Math.max(0, Math.min(1, gainParam.value)), now
+            );
+            gainNode.connect(audioCtx.destination);
+            tc.vars.isolatedOutputUsesLimiter = false;
+        } catch (fallbackError) {
+            if (tc.settings.debugMode) log(`isolated output fallback failed: ${fallbackError && fallbackError.message}`, 3);
+        }
+        if (tc.settings.debugMode) log(`isolated output route failed: ${e && e.message}`, 3);
+    }
+}
+
 function applyState() {
     enforceBoostLimit();
     syncPageAudioHook();
@@ -884,9 +1008,22 @@ function applyState() {
     const audioCtx = tc.vars.audioCtx;
     const gainNode = tc.vars.gainNode;
     const isEnabled = !tc.vars.isBlocked;
-    const targetGain = isEnabled ? (tc.vars.muted ? 0 : getGainValue(tc.vars.dB)) : 1.0;
-
+    const autoGain = tc.vars.normalizerEnabled
+        ? Math.pow(10, (Number(tc.vars.normalizerGainDb) || 0) / 20)
+        : 1;
     if (gainNode && audioCtx) {
+        ensureIsolatedNormalizerTimer();
+        // The limiter may remain routed during manual boost while Normalize
+        // is off. Changes from Options must still update its parameters.
+        if (tc.vars.isolatedOutputUsesLimiter) configureIsolatedLimiter();
+        routeIsolatedOutput();
+        // If the limiter failed and audio was restored directly, do not
+        // expose automatic gain or positive manual boost without protection.
+        const wantsLimiter = isEnabled &&
+            (tc.vars.normalizerEnabled || (!tc.vars.muted && tc.vars.dB > 0));
+        const unprotected = wantsLimiter && tc.vars.isolatedOutputUsesLimiter !== true;
+        const manualGain = unprotected ? Math.min(1, getGainValue(tc.vars.dB)) : getGainValue(tc.vars.dB);
+        const targetGain = isEnabled ? (tc.vars.muted ? 0 : manualGain * (unprotected ? 1 : autoGain)) : 1;
         const now = audioCtx.currentTime;
 
         if (audioCtx.state === 'running') {
@@ -969,12 +1106,152 @@ function applyState() {
     setTimeout(suspendAudioContextIfIdle, 250);
 }
 
+function configureIsolatedLimiter() {
+    const limiter = tc.vars.limiterNode;
+    if (!limiter) return;
+    const config = normalizeNormalizerConfig(tc.settings.normalizerConfig);
+    try {
+        limiter.threshold.value = config.ceilingDb;
+        limiter.knee.value = 0;
+        limiter.ratio.value = 20;
+        limiter.attack.value = 0.003;
+        limiter.release.value = 0.12;
+    } catch (e) {
+        if (tc.settings.debugMode) log(`isolated limiter configure failed: ${e && e.message}`, 3);
+    }
+}
+
+function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, config) {
+        // Never amplify the noise floor or reuse stale gain if the analyser
+        // reports silence/errors. This is intentionally independent of the
+        // volume slider so users retain control of the final output level.
+        if (!Number.isFinite(sourceRmsDb) || sourceRmsDb <= -55 ||
+            !Number.isFinite(sourcePeakDb)) return 0;
+
+        const previous = Number.isFinite(previousDb) ? previousDb : 0;
+        // Leave a 2 dB sample-peak margin below the requested compressor
+        // threshold. This reduces sudden overshoot; it is NOT a hard or
+        // inter-sample true-peak guarantee (WebAudio compressors aren't).
+        const rmsTarget = config.targetDb - sourceRmsDb;
+        const peakHeadroom = config.ceilingDb - 2 - sourcePeakDb;
+        const desired = Math.max(-32, Math.min(config.maxBoostDb, rmsTarget, peakHeadroom));
+
+        // Loudness jumps must shed existing boost immediately. Raising gain
+        // is deliberately much slower to avoid pumping from brief quiet gaps.
+        if (desired <= previous) return desired;
+        const alpha = 1 - Math.exp(-100 / Math.max(100, config.responseMs));
+        return previous + (desired - previous) * alpha;
+    }
+
+function sampleIsolatedNormalizer() {
+    if (!tc.vars.normalizerEnabled) return;
+    const ctx = tc.vars.audioCtx;
+    const analyser = tc.vars.analyserNode;
+    const sourceAnalyser = tc.vars.inputAnalyserNode;
+    const gainNode = tc.vars.gainNode;
+    if (!ctx || !analyser || !sourceAnalyser || !gainNode || ctx.state !== "running") return;
+
+    if (!tc.vars.analyserBuffer || tc.vars.analyserBuffer.length !== analyser.fftSize) {
+        tc.vars.analyserBuffer = new Float32Array(analyser.fftSize);
+    }
+
+    try {
+        analyser.getFloatTimeDomainData(tc.vars.analyserBuffer);
+    } catch (e) {
+        return;
+    }
+
+    let peak = 0;
+    for (let i = 0; i < tc.vars.analyserBuffer.length; i++) {
+        const sample = tc.vars.analyserBuffer[i];
+        const abs = Math.abs(sample);
+        if (abs > peak) peak = abs;
+    }
+    tc.vars.normalizerPeakDb = peak > 0.000001 ? 20 * Math.log10(peak) : -Infinity;
+
+    // Read loudness before manual volume, automatic gain, and output limiting.
+    // The final output analyser remains dedicated to peak-meter feedback.
+    if (!tc.vars.inputAnalyserBuffer || tc.vars.inputAnalyserBuffer.length !== sourceAnalyser.fftSize) {
+        tc.vars.inputAnalyserBuffer = new Float32Array(sourceAnalyser.fftSize);
+    }
+    let sourceRmsDb = -120;
+    let sourcePeakDb = -Infinity;
+    try {
+        sourceAnalyser.getFloatTimeDomainData(tc.vars.inputAnalyserBuffer);
+        let sourceSum = 0;
+        let sourcePeak = 0;
+        for (let i = 0; i < tc.vars.inputAnalyserBuffer.length; i++) {
+            const sample = tc.vars.inputAnalyserBuffer[i];
+            sourceSum += sample * sample;
+            sourcePeak = Math.max(sourcePeak, Math.abs(sample));
+        }
+        const sourceRms = Math.sqrt(sourceSum / Math.max(1, tc.vars.inputAnalyserBuffer.length));
+        sourceRmsDb = sourceRms > 0.000001 ? 20 * Math.log10(sourceRms) : -120;
+        sourcePeakDb = sourcePeak > 0.000001 ? 20 * Math.log10(sourcePeak) : -Infinity;
+    } catch (e) {}
+
+    const config = normalizeNormalizerConfig(tc.settings.normalizerConfig);
+    let gainDb = Number(tc.vars.normalizerGainDb) || 0;
+    const previousGainDb = gainDb;
+    if (tc.vars.normalizerEnabled && !tc.vars.muted && !tc.vars.isBlocked &&
+        tc.vars.isolatedOutputUsesLimiter === true) {
+        gainDb = computeSafeNormalizerGainDb(gainDb, sourceRmsDb, sourcePeakDb, config);
+    } else {
+        gainDb = 0;
+    }
+    if (Math.abs(gainDb) < 0.01) gainDb = 0;
+    tc.vars.normalizerGainDb = gainDb;
+
+    configureIsolatedLimiter();
+    try {
+        const now = ctx.currentTime;
+        const manualGain = tc.vars.isBlocked || tc.vars.muted ? (tc.vars.isBlocked ? 1 : 0) : getGainValue(tc.vars.dB);
+        // A 100 ms meter update cannot reinstate boost on an unprotected
+        // direct fallback. Retry limiter routing on the next state change.
+        const protectedOutput = tc.vars.isolatedOutputUsesLimiter === true;
+        const target = protectedOutput
+            ? manualGain * (tc.vars.normalizerEnabled ? Math.pow(10, gainDb / 20) : 1)
+            : Math.min(1, manualGain);
+        gainNode.gain.cancelScheduledValues(now);
+        gainNode.gain.setTargetAtTime(target, now, gainDb < previousGainDb ? 0.008 : 0.035);
+    } catch (e) {}
+}
+
+function ensureIsolatedNormalizerTimer() {
+    // Even an empty 100ms interval keeps waking background tabs. Only sample
+    // when an actual isolated route needs automatic gain control.
+    const shouldRun = !tc.vars.isBlocked && tc.vars.normalizerEnabled &&
+        Boolean(tc.vars.gainNode && tc.vars.audioCtx);
+    if (!shouldRun) {
+        if (tc.vars.normalizerTimer !== null) clearInterval(tc.vars.normalizerTimer);
+        tc.vars.normalizerTimer = null;
+        return;
+    }
+    if (tc.vars.normalizerTimer === null) {
+        tc.vars.normalizerTimer = setInterval(sampleIsolatedNormalizer, 100);
+    }
+}
+
 function createGainNode() {
     if (!tc.vars.audioCtx) return;
 
     if (!tc.vars.gainNode) {
         tc.vars.gainNode = tc.vars.audioCtx.createGain();
         tc.vars.gainNode.channelInterpretation = "speakers";
+        tc.vars.inputAnalyserNode = tc.vars.audioCtx.createAnalyser();
+        // 8192 input samples span ~171ms at 48kHz, overlapping successive
+        // 100ms checks to avoid peak detection gaps between timer ticks.
+        tc.vars.inputAnalyserNode.fftSize = 8192;
+        tc.vars.inputAnalyserNode.smoothingTimeConstant = 0.35;
+        tc.vars.inputAnalyserNode.connect(tc.vars.gainNode);
+        tc.vars.limiterNode = tc.vars.audioCtx.createDynamicsCompressor();
+        tc.vars.analyserNode = tc.vars.audioCtx.createAnalyser();
+        tc.vars.analyserNode.fftSize = 1024;
+        tc.vars.analyserNode.smoothingTimeConstant = 0.35;
+        tc.vars.isolatedOutputUsesLimiter = null;
+        // applyState() wires the correct output path; do not pre-connect a
+        // compressor when normalization and positive boost are both off.
+        ensureIsolatedNormalizerTimer();
     }
     applyState();
 }
@@ -1107,39 +1384,6 @@ function suspendAudioContextIfIdle() {
     tc.vars.audioSuspendPromise = promise;
 }
 
-function mediaSourceKey(element) {
-    try {
-        if (!element) return "";
-        if (element.srcObject) return "stream:" + String(element.srcObject.id || "");
-        return String(element.currentSrc || element.src || "");
-    } catch (e) {
-        return "";
-    }
-}
-
-function resetEphemeralControlsForMediaBoundary(element) {
-    if (tc.vars.hasRememberedSettings || tc.vars.isBlocked || !element) return;
-    const previousElement = tc.vars.ephemeralActiveElement;
-    const previousSource = tc.vars.ephemeralSourceKeys.get(element) || "";
-    const currentSource = mediaSourceKey(element);
-    const pendingBoundary = tc.vars.ephemeralBoundaryPending.has(element);
-    const changedElement = Boolean(previousElement && previousElement !== element);
-    const changedSource = Boolean(previousSource && currentSource && previousSource !== currentSource);
-
-    if (previousElement && (changedElement || changedSource || pendingBoundary)) {
-        tc.vars.dB = 0;
-        tc.vars.mono = false;
-        tc.vars.muted = false;
-        lastSyncedPageAudioState = null;
-        applyState();
-        syncPageAudioHook();
-    }
-
-    tc.vars.ephemeralActiveElement = element;
-    tc.vars.ephemeralSourceKeys.set(element, currentSource);
-    tc.vars.ephemeralBoundaryPending.delete(element);
-}
-
 function registerMediaElement(element) {
     if (!element) return;
     // Track all media elements (even page-managed ones) so applyState can
@@ -1168,7 +1412,6 @@ function registerMediaElement(element) {
     element.dataset.vcWatched = "true";
 
     const hookIfPlaying = () => {
-        if (isMediaPlaying(element)) resetEphemeralControlsForMediaBoundary(element);
         if (isPageAudioManaged(element)) {
             if (element.dataset.vcFallback === 'true') clearFallbackVolume(element);
             return;
@@ -1206,10 +1449,6 @@ function registerMediaElement(element) {
     // v6.14: a new source must re-earn its EME decryption proof.
     element.addEventListener('emptied', () => {
         resetEmePending(element);
-        tc.vars.ephemeralBoundaryPending.add(element);
-    }, { passive: true });
-    element.addEventListener('loadstart', () => {
-        if (tc.vars.ephemeralActiveElement === element) tc.vars.ephemeralBoundaryPending.add(element);
     }, { passive: true });
     const scheduleSuspend = () => setTimeout(suspendAudioContextIfIdle, 250);
     for (const evt of ['pause', 'ended', 'emptied']) {
@@ -1285,6 +1524,15 @@ function connectOutput(element) {
         // before constructing a replacement context or connect() will throw a
         // cross-context InvalidAccessError.
         tc.vars.gainNode = undefined;
+        tc.vars.inputAnalyserNode = undefined;
+        tc.vars.inputAnalyserBuffer = undefined;
+        tc.vars.limiterNode = undefined;
+        tc.vars.analyserNode = undefined;
+        tc.vars.analyserBuffer = undefined;
+        if (tc.vars.normalizerTimer !== null) {
+            clearInterval(tc.vars.normalizerTimer);
+            tc.vars.normalizerTimer = null;
+        }
         // If the context was closed (e.g. the page itself called .close()
         // on it, or a previous extension version closed it), create a fresh
         // one. Note: any elements previously hooked on the old context have
@@ -1348,8 +1596,7 @@ function connectOutput(element) {
         }
 
         if (source) {
-            source.connect(tc.vars.gainNode);
-            tc.vars.gainNode.connect(tc.vars.audioCtx.destination);
+            source.connect(tc.vars.inputAnalyserNode);
 
             element.dataset.vcHooked = "true";
             tc.vars.mediaElements.add(element);
@@ -1513,7 +1760,7 @@ async function start() {
     const generation = ++startGeneration;
     controlProfileReady = false;
     try {
-        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, whitelistSeparatedV1: false, siteSettings: {}, siteDebugSettings: {}, siteDebugSettingsSeparatedV1: false, debugMode: false, forceDrmCapture: false, forceCorsCapture: false, debugRouteMode: "auto", legacyTwitchDefaultsPurged: false });
+        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, whitelistSeparatedV1: false, siteSettings: {}, siteNormalizerSettings: {}, normalizerDefaultEnabled: false, siteDebugSettings: {}, siteDebugSettingsSeparatedV1: false, debugMode: false, forceDrmCapture: false, forceCorsCapture: false, debugRouteMode: "auto", normalizerConfig: DEFAULT_NORMALIZER_CONFIG, legacyTwitchDefaultsPurged: false });
         if (generation !== startGeneration) return;
 
         // One-time migration (issue #69): V4-era builds seeded default
@@ -1535,7 +1782,16 @@ async function start() {
         if (!isTopFrame() && controlUrl) profileControlUrl = controlUrl;
         const currentDomain = extractRootDomain(controlUrl);
         const siteSettingsKey = applyEffectiveDebugSettings(data, controlUrl);
-        tc.vars.hasRememberedSettings = Boolean(siteSettingsKey);
+        tc.settings.normalizerConfig = normalizeNormalizerConfig(data.normalizerConfig);
+        const normalizerSettingsKey = getSiteSettingsKey(data.siteNormalizerSettings || {}, controlUrl);
+        const resolvedNormalizerEnabled = normalizerSettingsKey
+            ? Boolean(data.siteNormalizerSettings[normalizerSettingsKey]?.enabled)
+            : Boolean(data.normalizerDefaultEnabled);
+        if (tc.vars.normalizerEnabled !== resolvedNormalizerEnabled) {
+            tc.vars.normalizerGainDb = 0;
+            tc.vars.normalizerPeakDb = -Infinity;
+        }
+        tc.vars.normalizerEnabled = resolvedNormalizerEnabled;
 
         // Debug: show state used to decide blocking
         if (tc.settings.debugMode) {
@@ -1545,8 +1801,8 @@ async function start() {
         let blocked = false;
         if (data.whitelistMode) {
             // Whitelist authorization is independent from Remembered Settings.
-            // This lets users allow a site while keeping each tab/navigation at
-            // its own ephemeral 0 dB state (issue #72).
+            // This lets allowed tabs retain independent temporary controls
+            // through playlist/SPA transitions without saving them to storage.
             const explicitAllowed = (data.whitelist || []).some(entry => isUrlRememberedByEntry(controlUrl, entry));
             const legacyAllowed = !data.whitelistSeparatedV1 && Boolean(siteSettingsKey);
             const allowed = explicitAllowed || legacyAllowed;
@@ -1562,7 +1818,14 @@ async function start() {
         // Debug: log final decision
         if (tc.settings.debugMode) log(`start(): blocked=${blocked}`, 4);
 
-        // Ensure the content script's blocked flag reflects the current state (clear it when unblocked)
+        // Entering or leaving the blocklist must not bring back old
+        // automatic boost. A fast block/unblock could happen before the
+        // 100ms normalizer sampler clears its previous +dB gain.
+        if (tc.vars.isBlocked !== blocked) {
+            tc.vars.normalizerGainDb = 0;
+            tc.vars.normalizerPeakDb = -Infinity;
+            lastSyncedPageAudioState = null;
+        }
         tc.vars.isBlocked = blocked;
         controlProfileReady = true;
         if (blocked) {
@@ -1586,17 +1849,10 @@ async function start() {
             if (s.volume !== undefined) tc.vars.dB = normalizeDb(s.volume);
             if (s.mono !== undefined) tc.vars.mono = s.mono;
             if (s.muted !== undefined) tc.vars.muted = Boolean(s.muted);
-        } else if (lastResolvedControlUrl && controlUrl && controlUrl !== lastResolvedControlUrl) {
-            // "Remember" off means the control state is ephemeral. Reset when
-            // an SPA moves to a new video/page instead of carrying the previous
-            // video's dB/mute/mono state forward. Separate tabs already have
-            // separate content-script state; this also gives issue #72 the
-            // expected new-video default on URL-changing players such as YouTube.
-            tc.vars.dB = 0;
-            tc.vars.mono = false;
-            tc.vars.muted = false;
         }
-        lastResolvedControlUrl = controlUrl;
+        // With Remember off, preserve unsaved volume/mono/mute inside this
+        // document/tab across SPA navigation and playlist changes. New tabs
+        // and actual reloads still start from default 0 dB controls.
 
         applyState();
         ensurePageBridgeResync();
@@ -1648,6 +1904,23 @@ window.addEventListener("message", (event) => {
         return;
     }
 
+    if (data.command === "meterUpdate") {
+        // Ignore an in-flight page meter tick if Normalize was just disabled
+        // or the site became blocked. Otherwise it could restore the old
+        // automatic gain after our blocklist/Normalize reset.
+        if (!tc.vars.normalizerEnabled || tc.vars.isBlocked) return;
+        // Chrome's JSON-based extension messaging may turn non-finite
+        // numbers into null. A null peak means silence/unknown, never 0
+        // dBFS (full-scale), and missing gain must not become NaN.
+        tc.vars.normalizerPeakDb =
+            typeof data.peakDb === "number" && Number.isFinite(data.peakDb)
+                ? data.peakDb : -Infinity;
+        tc.vars.normalizerGainDb =
+            typeof data.normalizerGainDb === "number" && Number.isFinite(data.normalizerGainDb)
+                ? data.normalizerGainDb : 0;
+        return;
+    }
+
     if (data.command !== "requestState") return;
 
     // Reset the sync skip-cache so the next syncPageAudioHook actually sends
@@ -1672,6 +1945,9 @@ if (browserAPI && browserAPI.storage && browserAPI.storage.onChanged) {
             changes.whitelist ||
             changes.fqdns ||
             changes.siteSettings ||
+            changes.siteNormalizerSettings ||
+            changes.normalizerDefaultEnabled ||
+            changes.normalizerConfig ||
             changes.siteDebugSettings ||
             changes.siteDebugSettingsSeparatedV1 ||
             changes.debugMode ||

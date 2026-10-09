@@ -1,9 +1,8 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
 
 const root = resolve(import.meta.dirname, '..');
 const extensionRoot = process.env.VC_EXTENSION_DIR ? resolve(process.env.VC_EXTENSION_DIR) : root;
@@ -53,6 +52,11 @@ try {
             resolveResult({ pass, detail });
             return;
         }
+        if (url.pathname === '/') {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(html);
+            return;
+        }
         res.writeHead(404);
         res.end('not found');
     });
@@ -78,6 +82,16 @@ window.__vcNativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.proto
 <script>
 (async () => {
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    // A busy Firefox event loop may need more than a fixed 60ms to process
+    // postMessage. Wait for actual state, but stay below the 3s mute failsafe.
+    const waitFor = async (predicate, timeoutMs = 1800) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (predicate()) return true;
+            await sleep(25);
+        }
+        return predicate();
+    };
     const token = "ffffffffffffffffffffffffffffffff";
     const preflightPatched = AudioNode.prototype.connect !== window.__vcNativeConnect;
 
@@ -91,7 +105,7 @@ window.__vcNativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.proto
         target: "volume-control-page-audio",
         token,
         command: "setState",
-        version: 2,
+        version: 3,
         enabled: false,
         dB: 0,
         mono: false,
@@ -101,12 +115,10 @@ window.__vcNativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.proto
         forceCorsCapture: false,
         debugRouteMode: "auto"
     }, "*");
-    await sleep(60);
-
-    const disabledRestored =
+    const disabledRestored = await waitFor(() =>
         AudioNode.prototype.connect === window.__vcNativeConnect &&
         AudioNode.prototype.disconnect === window.__vcNativeDisconnect &&
-        Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume").set === window.__vcNativeVolume.set;
+        Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume").set === window.__vcNativeVolume.set);
     const preflightRestored = earlyAudio.muted === false;
 
     window.postMessage({
@@ -114,7 +126,7 @@ window.__vcNativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.proto
         target: "volume-control-page-audio",
         token,
         command: "setState",
-        version: 2,
+        version: 3,
         enabled: true,
         dB: -6,
         mono: false,
@@ -124,9 +136,8 @@ window.__vcNativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.proto
         forceCorsCapture: false,
         debugRouteMode: "auto"
     }, "*");
-    await sleep(60);
-
-    const reenabledPatched = AudioNode.prototype.connect !== window.__vcNativeConnect;
+    const reenabledPatched = await waitFor(() =>
+        AudioNode.prototype.connect !== window.__vcNativeConnect);
     const result = { preflightPatched, preflightMuted, preflightRestored, disabledRestored, reenabledPatched };
     const pass = Object.values(result).every(Boolean);
     location.href = "http://127.0.0.1:${port}/result?pass=" + (pass ? "1" : "0") +
@@ -134,15 +145,15 @@ window.__vcNativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.proto
 })();
 </script>`;
 
-    const page = join(work, 'smoke.html');
-    writeFileSync(page, html, 'utf8');
-
+    // Firefox treats file:// pages differently from regular sites (notably
+    // postMessage sender identity). Exercise the bridge on a real HTTP origin,
+    // just like the installed-extension smoke and ordinary web pages.
     let stderr = '';
     child = spawn(browser, [
         '-headless',
         '-no-remote',
         '-profile', profile,
-        pathToFileURL(page).href
+        `http://127.0.0.1:${port}/`
     ], {
         windowsHide: true,
         stdio: ['ignore', 'ignore', 'pipe']

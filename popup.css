@@ -384,3 +384,118 @@ input:checked + .slider:before { transform: translateX(16px); }
 #popup-content.is-muted #volume-slider {
     cursor: not-allowed;
 }
+
+
+/* Normalizer + live peak meter */
+.normalizer-panel {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(127, 127, 127, 0.28);
+}
+
+.normalizer-header,
+.peak-meter-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.normalizer-header {
+    justify-content: space-between;
+    margin-bottom: 7px;
+}
+
+.normalizer-switch {
+    margin: 0;
+}
+
+.normalizer-gain,
+.peak-meter-text {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    font-size: 12px;
+}
+
+.normalizer-gain {
+    opacity: 0.8;
+}
+
+.peak-meter-row {
+    width: 100%;
+}
+
+.peak-meter {
+    position: relative;
+    flex: 1 1 auto;
+    height: 9px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(127, 127, 127, 0.24);
+}
+
+.peak-meter-fill {
+    width: 0%;
+    height: 100%;
+    border-radius: inherit;
+    background: currentColor;
+    transition: width 90ms linear;
+}
+
+.peak-meter-ceiling {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 98.3333%;
+    width: 1px;
+    background: currentColor;
+    opacity: 0.7;
+}
+
+.peak-meter-text {
+    min-width: 66px;
+    text-align: right;
+}
+
+.normalizer-note {
+    margin: 6px 0 0;
+    font-size: 11px;
+    line-height: 1.25;
+    opacity: 0.82;
+}
+
+.normalizer-panel.is-unavailable .normalizer-header,
+.normalizer-panel.is-unavailable .peak-meter-row {
+    opacity: 0.6;
+}
+
+/* Action popups are typically ~420px wide on DESKTOP too. A width-only
+   breakpoint incorrectly activates the Android rules there and collapses the
+   fixed desktop popup. Restrict responsive controls to touch-first devices. */
+@media (hover: none) and (pointer: coarse) {
+  html, body { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
+  #popup-content, #error-content { width: 100%; box-sizing: border-box; }
+  .top-controls { padding: 8px 12px 0; margin-bottom: 12px; }
+  .bot-controls { padding: 0 12px 12px; gap: 12px; flex-wrap: wrap; margin-bottom: 0; }
+  .left, .right { gap: 12px; flex-wrap: wrap; }
+  .right { margin-left: auto; }
+  .switch-container, .settings, .mute-btn { min-height: 44px; }
+  .switch-container { gap: 0; }
+  .switch { width: 44px; height: 28px; }
+  .slider { border-radius: 28px; }
+  .slider:before { width: 20px; height: 20px; }
+  input:checked + .slider:before { transform: translateX(16px); }
+  .settings { padding: 8px; }
+  .mute-btn { padding: 6px 10px; }
+  input[type=range] { height: 44px; margin: 4px 0 8px; touch-action: pan-y; }
+  input[type=range]::-moz-range-track { height: 12px; }
+  input[type=range]::-moz-range-thumb { width: 24px; height: 32px; border-radius: 7px; }
+  input[type=range]::-webkit-slider-thumb { width: 24px; height: 32px; margin-top: -11px; border-radius: 7px; }
+  #volume-text { font-size: 18px; min-height: 36px; }
+}
+
+/* Keep the Normalize switch visible while folding the meter and gain below it. */
+.normalizer-details[hidden] { display: none !important; }
+.normalizer-detail-header { display: flex; justify-content: flex-end; margin: 0 0 6px; }
+.normalizer-panel .normalizer-header { margin-bottom: 0; }
+.normalizer-panel .normalizer-details { padding-top: 8px; }
+.normalizer-panel.is-unavailable .normalizer-switch { opacity: 1; }

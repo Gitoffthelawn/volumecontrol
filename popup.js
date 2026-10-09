@@ -27,9 +27,14 @@ const sharedExtractRootDomain = globalThis.VolumeControlShared.extractRootDomain
 const WHEEL_STEP_DB = 1;  // volume change per wheel notch (matches hotkey step)
 let siteSettingsSaveChain = Promise.resolve();
 let volumeRequestGeneration = 0;
+let normalizerRequestGeneration = 0;
 
 function mutateSiteSettings(mutation) {
   return runtimeSendMessage({ command: "mutateSiteSettings", mutation });
+}
+
+function mutateSiteNormalizerSettings(mutation) {
+  return runtimeSendMessage({ command: "mutateSiteNormalizerSettings", mutation });
 }
 
 function mutateAccessLists(mutation) {
@@ -48,12 +53,20 @@ const cached = {
   limitNote: null,
   monoCheckbox: null,
   rememberCheckbox: null,
+  normalizerCheckbox: null,
+  normalizerGain: null,
+  peakMeter: null,
+  peakMeterFill: null,
+  peakMeterText: null,
+  normalizerNote: null,
   enableCheckbox: null,
   muteBtn: null,
   activeTab: null,
   maxDb: MAX_DB,
   boostLimited: false,
   monoAvailable: true,
+  normalizerAvailable: true,
+  normalizerPending: false,
   shortcuts: {}
 };
 
@@ -83,7 +96,10 @@ function exclusionOverlayDetail(data, tabUrl) {
 
 document.addEventListener('DOMContentLoaded', () => {
   const slider = document.getElementById('volume-slider');
-  if (slider) {
+  // Focusing on Android summons the soft keyboard and can obscure the
+  // extension overlay. Desktop keeps its keyboard-first behavior.
+  const isAndroid = /Android/i.test(navigator.userAgent);
+  if (slider && !isAndroid) {
       slider.focus();
   }
 
@@ -102,11 +118,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (message.type === "exclusion") showError({ type: "exclusion" });
   });
 
-  document.addEventListener('keydown', () => {
-    if (slider && document.activeElement !== slider) {
-      slider.focus();
-    }
-  }, { once: true });
+  if (!isAndroid) {
+    document.addEventListener('keydown', () => {
+      if (slider && document.activeElement !== slider) {
+        slider.focus();
+      }
+    }, { once: true });
+  }
 
   // Mouse wheel: change volume by WHEEL_STEP_DB per notch while the popup is open.
   // Bound to document so it works anywhere in the popup. Skip when the user is
@@ -135,10 +153,19 @@ document.addEventListener('DOMContentLoaded', () => {
   listenForEvents();
 });
 
-function listenForEvents() {
-  tabsQuery({ active: true, currentWindow: true })
-      .then(handleTabs)
-      .catch(handleError);
+async function listenForEvents() {
+  try {
+    let tabs = await tabsQuery({ active: true, currentWindow: true });
+    // On some Android builds the action UI has its own browsing context.
+    // Fall back to the most recently focused browser window, not an extension tab.
+    if (!tabs?.[0]?.url || /^(moz-extension|about):/.test(tabs[0].url)) {
+      const fallback = await tabsQuery({ active: true, lastFocusedWindow: true });
+      if (fallback?.[0]?.url && !/^(moz-extension|about):/.test(fallback[0].url)) tabs = fallback;
+    }
+    handleTabs(tabs);
+  } catch (error) {
+    handleError(error);
+  }
 }
 
 function handleTabs(tabs) {
@@ -402,6 +429,70 @@ function applyMonoAvailability(state = {}) {
   }
 }
 
+
+function formatMeterDb(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= -90) return "−∞ dBFS";
+  return `${n.toFixed(1)} dBFS`;
+}
+
+function applyNormalizerState(state = {}) {
+  const checkbox = cached.normalizerCheckbox || document.querySelector("#normalizer-checkbox");
+  const gainEl = cached.normalizerGain || document.querySelector("#normalizer-gain");
+  const meter = cached.peakMeter || document.querySelector(".peak-meter");
+  const fill = cached.peakMeterFill || document.querySelector("#peak-meter-fill");
+  const text = cached.peakMeterText || document.querySelector("#peak-meter-text");
+  const note = cached.normalizerNote || document.querySelector("#normalizer-note");
+  const panel = checkbox ? checkbox.closest(".normalizer-panel") : null;
+
+  if (state.normalizerEnabled !== undefined && checkbox && !cached.normalizerPending) {
+    checkbox.checked = Boolean(state.normalizerEnabled);
+  }
+  const details = document.getElementById("normalizer-details");
+  if (details) details.hidden = !(checkbox && checkbox.checked);
+
+  if (state.normalizerAvailable !== undefined) {
+    cached.normalizerAvailable = state.normalizerAvailable !== false;
+  }
+  const available = cached.normalizerAvailable;
+  if (checkbox) {
+    // Keep the switch available even when this media cannot be processed.
+    checkbox.disabled = false;
+    checkbox.setAttribute("aria-disabled", "false");
+  }
+  if (panel) panel.classList.toggle("is-unavailable", !available);
+  if (note) {
+    const reason = state.normalizerUnavailableReason || state.limitationReason || "";
+    note.textContent = reason === "restricted"
+      ? "Normalization is unavailable for this DRM/restricted media in the current browser."
+      : reason === "cross-origin"
+        ? "Normalization is unavailable because this media cannot be safely routed through WebAudio."
+        : reason === "native-route"
+          ? "Normalization is unavailable while HTML Media Route Override is set to Force native."
+          : "Normalization needs the WebAudio route and is unavailable on this media.";
+    note.classList.toggle("hidden", available);
+  }
+
+  // Chrome runtime messages may JSON-serialize -Infinity as null.
+  // Null means silence / unknown, not a full-scale 0 dBFS peak.
+  const peakDb = typeof state.peakDb === "number" && Number.isFinite(state.peakDb)
+    ? state.peakDb : -Infinity;
+  const clampedPeak = Number.isFinite(peakDb) ? Math.max(-60, Math.min(0, peakDb)) : -60;
+  const percent = ((clampedPeak + 60) / 60) * 100;
+  if (fill) fill.style.width = `${percent.toFixed(2)}%`;
+  if (text) text.textContent = formatMeterDb(peakDb);
+  if (meter) {
+    meter.setAttribute("aria-valuenow", String(clampedPeak.toFixed(1)));
+    meter.setAttribute("aria-valuetext", formatMeterDb(peakDb));
+  }
+
+  const gainDb = Number(state.normalizerGainDb);
+  if (gainEl) {
+    const shown = Number.isFinite(gainDb) ? gainDb : 0;
+    gainEl.textContent = `Gain ${shown >= 0 ? "+" : ""}${shown.toFixed(1)} dB`;
+  }
+}
+
 function applyAudioControlState(state = {}) {
   const maxDb = Number.isFinite(Number(state.maxDb)) ? normalizeDb(state.maxDb) : MAX_DB;
 
@@ -423,6 +514,7 @@ function applyAudioControlState(state = {}) {
   }
 
   applyMonoAvailability(state);
+  applyNormalizerState(state);
 
   // Keep the mute button in sync with the content script's actual state.
   // This matters when a setVolume response carries a muted flag that was
@@ -464,6 +556,15 @@ async function pollAudioControlState(tab) {
     applyAudioControlState(state);
     if (state.mono !== undefined && cached.monoCheckbox) cached.monoCheckbox.checked = Boolean(state.mono);
     if (state.muted !== undefined) applyMuteButtonState(state.muted);
+    return state;
+}
+
+
+async function pollMeterState(tab) {
+    if (!tab || tab.id === undefined || !cached.normalizerCheckbox?.checked) return null;
+    const response = await tabsSendMessage(tab.id, { command: "getMeterState" }, TOP_FRAME_OPTIONS).catch(() => null);
+    const state = response && response.response ? response.response : null;
+    if (state) applyNormalizerState(state);
     return state;
 }
 
@@ -554,6 +655,47 @@ async function toggleMono(tab) {
   if (tab && monoCheckbox && !monoCheckbox.disabled && cached.monoAvailable) {
       await tabsSendMessage(tab.id, { command: "setMono", mono: monoCheckbox.checked }).catch(handleError);
       await saveSiteSettings(tab);
+  }
+}
+
+
+async function toggleNormalizer(tab) {
+  const checkbox = cached.normalizerCheckbox || document.querySelector("#normalizer-checkbox");
+  // Availability describes the *current audio route*, not whether a site
+  // preference can be saved. Let users switch normalization off or pre-enable
+  // it even when the current player is restricted or still loading.
+  if (!tab || !checkbox || checkbox.disabled) return;
+
+  const enabled = Boolean(checkbox.checked);
+  const requestGeneration = ++normalizerRequestGeneration;
+  cached.normalizerPending = true;
+  applyNormalizerState({ normalizerEnabled: enabled });
+  try {
+    const defaultKey = normalizeSiteSettingsEntryInput(tab.url);
+    if (!defaultKey) throw new Error("Cannot save a normalization preference for this URL");
+    // Save before messaging the tab: a still-loading or restricted page may
+    // not have a content-script receiver, but its saved preference is valid.
+    const result = await mutateSiteNormalizerSettings({
+      type: "setForUrl",
+      url: tab.url,
+      defaultKey,
+      enabled
+    });
+    if (!result?.ok) throw new Error(result?.reason || "Could not save normalization setting");
+    // Persistence broadcasts storage.onChanged to every frame. The targeted
+    // message merely accelerates the active top frame and is best-effort.
+    await tabsSendMessage(tab.id, { command: "setNormalizer", enabled }, TOP_FRAME_OPTIONS).catch(() => {});
+  } catch (error) {
+    if (requestGeneration === normalizerRequestGeneration) {
+      cached.normalizerPending = false;
+      applyNormalizerState({ normalizerEnabled: !enabled });
+      handleError(error);
+    }
+    return;
+  }
+  if (requestGeneration === normalizerRequestGeneration) {
+    cached.normalizerPending = false;
+    await refreshAudioControlState(tab);
   }
 }
 
@@ -661,12 +803,19 @@ async function initializeControls(tab) {
     const limitNote = document.querySelector("#volume-limit-note");
     const monoCheckbox = document.querySelector("#mono-checkbox");
     const rememberCheckbox = document.querySelector("#remember-checkbox");
+    const normalizerCheckbox = document.querySelector("#normalizer-checkbox");
 
     cached.slider = volumeSlider;
     cached.volumeText = volumeText;
     cached.limitNote = limitNote;
     cached.monoCheckbox = monoCheckbox;
     cached.rememberCheckbox = rememberCheckbox;
+    cached.normalizerCheckbox = normalizerCheckbox;
+    cached.normalizerGain = document.querySelector("#normalizer-gain");
+    cached.peakMeter = document.querySelector(".peak-meter");
+    cached.peakMeterFill = document.querySelector("#peak-meter-fill");
+    cached.peakMeterText = document.querySelector("#peak-meter-text");
+    cached.normalizerNote = document.querySelector("#normalizer-note");
 
     const muteBtn = document.querySelector("#mute-btn");
     cached.muteBtn = muteBtn;
@@ -735,6 +884,7 @@ async function initializeControls(tab) {
     }
 
     if (monoCheckbox) monoCheckbox.addEventListener("change", () => toggleMono(tab));
+    if (normalizerCheckbox) normalizerCheckbox.addEventListener("change", () => toggleNormalizer(tab));
     if (rememberCheckbox) rememberCheckbox.addEventListener("change", () => toggleRemember(tab));
 
     const domain = extractRootDomain(tab.url);
@@ -749,6 +899,9 @@ async function initializeControls(tab) {
     setInterval(() => {
         pollAudioControlState(tab).catch(() => {});
     }, 1000);
+    setInterval(() => {
+        pollMeterState(tab).catch(() => {});
+    }, 125);
 
     try {
         const audioState = await refreshAudioControlState(tab);
@@ -757,11 +910,16 @@ async function initializeControls(tab) {
         const saved = settingsKey ? data.siteSettings[settingsKey] : null;
         if (saved) {
             if (rememberCheckbox) rememberCheckbox.checked = true;
-            if (saved.mono !== undefined && monoCheckbox) monoCheckbox.checked = saved.mono;
-            if (saved.muted !== undefined) applyMuteButtonState(saved.muted);
-            if (saved.volume !== undefined) await setVolume(saved.volume, tab, { showFeedback: false });
-            tabsSendMessage(tab.id, { command: "setMono", mono: Boolean(saved.mono) }).catch(handleError);
-            tabsSendMessage(tab.id, { command: "setMute", muted: Boolean(saved.muted) }).catch(handleError);
+            // The content script already applies Remember on page initialization
+            // and on storage changes. Replaying storage here overwrites newer
+            // in-tab state (and may send a brief loud gain change) just because
+            // the popup was opened. Only use storage for DISPLAY if this tab
+            // has no reachable content-script state.
+            if (!audioState) {
+                if (saved.volume !== undefined) setDisplayedVolume(saved.volume);
+                if (saved.mono !== undefined && monoCheckbox) monoCheckbox.checked = Boolean(saved.mono);
+                if (saved.muted !== undefined) applyMuteButtonState(saved.muted);
+            }
         } else if (!audioState) {
             tabsSendMessage(tab.id, { command: "getVolume" }, TOP_FRAME_OPTIONS).then((response) => {
                 if (response && response.response !== undefined) setVolume(response.response, null);

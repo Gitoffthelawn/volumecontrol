@@ -5,7 +5,7 @@
     const MEDIA_MANAGED_ATTR = "vcPageAudioManaged";
     const MIN_DB = -32;
     const MAX_DB = 32;
-    const BRIDGE_VERSION = 2;
+    const BRIDGE_VERSION = 3;
     const HEARTBEAT_TIMEOUT_MS = 10000;
     const supportsWeakRef = typeof WeakRef !== "undefined";
 
@@ -16,6 +16,8 @@
         dB: 0,
         mono: false,
         muted: false,
+        normalizerEnabled: false,
+        normalizerConfig: { targetDb: -16, maxBoostDb: 12, ceilingDb: -1, responseMs: 600 },
         debugMode: false,
         forceDrmCapture: false,
         forceCorsCapture: false,
@@ -35,6 +37,7 @@
     let hooksInstalled = false;
     let mediaObserver = null;
     let maintenanceTimerIds = [];
+    let normalizerMeterTimerId = null;
     let howlerPollId = null;
     let gestureListenersInstalled = false;
     let authorizationResolved = false;
@@ -100,6 +103,40 @@
     function getGainValue(dB) {
         const n = normalizeDb(dB);
         return Math.pow(10, n / 20);
+    }
+
+    function dbToGain(dB) {
+        const n = Number(dB);
+        return Number.isFinite(n) ? Math.pow(10, n / 20) : 1;
+    }
+
+    function normalizeNormalizerConfig(value = {}) {
+        if (!value || typeof value !== "object") value = {};
+        const finiteOr = (candidate, fallback) => {
+            if (candidate == null || (typeof candidate === "string" && !candidate.trim())) return fallback;
+            const n = Number(candidate);
+            return Number.isFinite(n) ? n : fallback;
+        };
+        return {
+            targetDb: Math.max(-30, Math.min(-6, finiteOr(value.targetDb, -16))),
+            maxBoostDb: Math.max(0, Math.min(24, finiteOr(value.maxBoostDb, 12))),
+            ceilingDb: Math.max(-6, Math.min(-0.1, finiteOr(value.ceilingDb, -1))),
+            responseMs: Math.max(100, Math.min(3000, Math.round(finiteOr(value.responseMs, 600))))
+        };
+    }
+
+    function configureLimiter(processor) {
+        if (!processor || !processor.limiter) return;
+        const config = normalizeNormalizerConfig(state.normalizerConfig);
+        try {
+            processor.limiter.threshold.value = config.ceilingDb;
+            processor.limiter.knee.value = 0;
+            processor.limiter.ratio.value = 20;
+            processor.limiter.attack.value = 0.003;
+            processor.limiter.release.value = 0.12;
+        } catch (e) {
+            log(`limiter configure failed: ${e && e.message}`);
+        }
     }
 
     function markNode(node) {
@@ -227,7 +264,7 @@
         const graph = graphs.get(nodeFromRef(entry.contextRef));
         if (!graph) return false;
         try {
-            disconnectNative(source, graph.gain, entry.outputIndex, 0);
+            disconnectNative(source, graph.inputAnalyser, entry.outputIndex, 0);
             return true;
         } catch (e) {
             log(`tracked route disconnect failed: ${e && e.message}`);
@@ -547,6 +584,8 @@
         safeDisconnect(route.leftGain);
         safeDisconnect(route.rightGain);
         safeDisconnect(route.merger);
+        safeDisconnect(route.limiter);
+        safeDisconnect(route.analyser);
         route.outputConnected = false;
     }
 
@@ -556,7 +595,7 @@
 
         disconnectMediaRouteOutput(route);
 
-        // Do NOT disconnect route.source from route.gain, and do NOT delete the
+        // Do NOT disconnect route.source from route.inputAnalyser, and do NOT delete the
         // route from mediaRoutes. The MediaElementSourceNode can only be created
         // once per element per context, so we must keep the existing source node
         // alive so it can be reconnected when playback resumes (e.g., after
@@ -573,8 +612,52 @@
         }
     }
 
+    function clampUnprotectedOutput(processor) {
+        // The native MediaElementSource has already been captured and cannot
+        // be restored by reconnecting the HTML element. If a limited route
+        // fails, connect directly but never allow stale boost to reach it.
+        processor.limiterFallbackActive = true;
+        processor.normalizerGainDb = 0;
+        processor.meterPeakDb = -Infinity;
+        try {
+            const param = processor.gain.gain;
+            const now = processor.context.currentTime;
+            const safeGain = Math.max(0, Math.min(1, effectiveGain()));
+            param.cancelScheduledValues(now);
+            param.setValueAtTime(safeGain, now);
+            return true;
+        } catch (e) {
+            log(`safe output gain clamp failed: ${e && e.message}`);
+            // Do not connect an unprotected output if its AudioParam may
+            // still hold +20 dB (or a scheduled ramp back to that gain).
+            return false;
+        }
+    }
+
+    function clampDirectOutputGain(processor) {
+        // Do not expose the previous (possibly >1) auto/manual gain on the
+        // first audio block after a limited -> direct route transition.
+        // Reconnecting before the ordinary 15 ms ramp would bypass the
+        // compressor while that old boost is still audible.
+        try {
+            const param = processor.gain.gain;
+            const now = processor.context.currentTime;
+            const safeGain = Math.max(0, Math.min(1, effectiveGain()));
+            param.cancelScheduledValues(now);
+            param.setValueAtTime(safeGain, now);
+            return true;
+        } catch (e) {
+            log(`direct output safety clamp failed: ${e && e.message}`);
+            // Keep the old limited route connected and retry on a future
+            // state sync; never open a direct path with an unknown AudioParam.
+            return false;
+        }
+    }
+
     function setGainValue(graph) {
-        const targetGain = effectiveGain();
+        const autoGain = state.normalizerEnabled ? dbToGain(graph.normalizerGainDb || 0) : 1;
+        const targetGain = graph.limiterFallbackActive
+            ? Math.min(1, effectiveGain()) : effectiveGain() * autoGain;
         try {
             const now = graph.context.currentTime;
             if (graph.context.state === "running") {
@@ -594,9 +677,18 @@
 
     // Compute the current routing mode string from state. Used by wireGraph and
     // wireMediaRoute to skip redundant disconnect/reconnect cycles.
+    function safetyLimiterRequired() {
+        // Keep clipping protection for manual positive boosts. At unity or
+        // attenuation with Normalize off, bypass the compressor entirely:
+        // even a nominal -1 dBFS compressor introduces processing/latency.
+        return state.extensionActive && state.enabled &&
+            (state.normalizerEnabled || (!state.muted && state.dB > 0));
+    }
+
     function currentRoutingMode() {
-        const wantMono = state.extensionActive && state.enabled && state.mono;
-        return (state.extensionActive && state.enabled) ? (wantMono ? "mono" : "stereo") : "bypass";
+        if (!state.extensionActive || !state.enabled) return "bypass";
+        return (state.mono ? "mono" : "stereo") +
+            (safetyLimiterRequired() ? "-limited" : "-direct");
     }
 
     // Connect a mono down-mix chain: gain → splitter → L/R gains → merger → destination.
@@ -613,28 +705,60 @@
     }
 
     function wireGraph(graph) {
-        setGainValue(graph);
-
-        // Skip the disconnect/reconnect cycle if the routing mode hasn't changed.
+        // Configure first, but do not raise the gain until the destination is
+        // routed through the limiter. Reversed ordering can briefly expose
+        // an amplified, unprotected direct path on unmute/enable.
+        configureLimiter(graph);
         const wantMode = currentRoutingMode();
-        if (graph.currentMode === wantMode) return;
-        graph.currentMode = wantMode;
+        if (graph.currentMode === wantMode && !graph.limiterFallbackActive) {
+            setGainValue(graph);
+            return;
+        }
+        if (!safetyLimiterRequired() && !clampDirectOutputGain(graph)) return;
 
         safeDisconnect(graph.gain);
         safeDisconnect(graph.splitter);
         safeDisconnect(graph.leftGain);
         safeDisconnect(graph.rightGain);
         safeDisconnect(graph.merger);
+        safeDisconnect(graph.limiter);
+        safeDisconnect(graph.analyser);
 
         try {
+            const useLimiter = safetyLimiterRequired();
+            const output = useLimiter ? graph.limiter : graph.context.destination;
             if (state.extensionActive && state.enabled && state.mono) {
-                connectMonoChain(graph.gain, graph.splitter, graph.leftGain, graph.rightGain, graph.merger, graph.context.destination);
+                connectMonoChain(graph.gain, graph.splitter, graph.leftGain, graph.rightGain, graph.merger, output);
             } else {
-                connectNative(graph.gain, graph.context.destination);
+                connectNative(graph.gain, output);
             }
+            if (useLimiter) {
+                configureLimiter(graph);
+                connectNative(graph.limiter, graph.analyser);
+                connectNative(graph.analyser, graph.context.destination);
+            }
+            // A failed graph rebuild must be retryable on the next state sync.
+            graph.currentMode = wantMode;
+            graph.limiterFallbackActive = false;
         } catch (e) {
+            graph.currentMode = null;
+            safeDisconnect(graph.gain);
+            safeDisconnect(graph.splitter);
+            safeDisconnect(graph.leftGain);
+            safeDisconnect(graph.rightGain);
+            safeDisconnect(graph.merger);
+            safeDisconnect(graph.limiter);
+            safeDisconnect(graph.analyser);
+            if (clampUnprotectedOutput(graph)) {
+                try {
+                    connectNative(graph.gain, graph.context.destination);
+                } catch (fallbackError) {
+                    log(`graph fallback failed: ${fallbackError && fallbackError.message}`);
+                }
+            }
             log(`graph wire failed: ${e && e.message}`);
         }
+        setGainValue(graph);
     }
 
     function ensureGraph(context) {
@@ -643,16 +767,35 @@
 
         try {
             const gain = markNode(context.createGain());
+            // Measure source RMS before the slider and automatic gain.
+            const inputAnalyser = markNode(context.createAnalyser());
             const splitter = markNode(context.createChannelSplitter(2));
             const leftGain = markNode(context.createGain());
             const rightGain = markNode(context.createGain());
             const merger = markNode(context.createChannelMerger(2));
+            const limiter = markNode(context.createDynamicsCompressor());
+            const analyser = markNode(context.createAnalyser());
 
             gain.channelInterpretation = "speakers";
             leftGain.gain.value = 0.5;
             rightGain.gain.value = 0.5;
+            analyser.fftSize = 1024;
+            analyser.smoothingTimeConstant = 0.35;
+            // 8192 frames span ~171ms at 48kHz, overlapping adjacent
+            // 100ms AGC samples rather than leaving ~15ms peak blind spots.
+            inputAnalyser.fftSize = 8192;
+            inputAnalyser.smoothingTimeConstant = 0.35;
 
-            const graph = { context, gain, splitter, leftGain, rightGain, merger, currentMode: null };
+            const graph = {
+                context, gain, inputAnalyser, splitter, leftGain, rightGain, merger, limiter, analyser,
+                currentMode: null,
+                limiterFallbackActive: false,
+                normalizerGainDb: 0,
+                meterPeakDb: -Infinity,
+                meterBuffer: new Float32Array(analyser.fftSize),
+                inputBuffer: new Float32Array(inputAnalyser.fftSize)
+            };
+            connectNative(inputAnalyser, gain);
             graphs.set(context, graph);
             addTrackedContext(context);
             wireGraph(graph);
@@ -1288,11 +1431,11 @@
         if (!state.extensionActive || !state.enabled) return false;
         if (state.debugRouteMode === "native") return false;
         if (state.debugRouteMode === "webaudio") return true;
-        return state.muted || state.mono || getGainValue(state.dB) > 1;
+        return state.muted || state.mono || state.normalizerEnabled || getGainValue(state.dB) > 1;
     }
 
     function pageAudioNeedsRoute() {
-        return state.extensionActive && state.enabled && (state.muted || state.mono || Number(state.dB) !== 0);
+        return state.extensionActive && state.enabled && (state.muted || state.mono || state.normalizerEnabled || Number(state.dB) !== 0);
     }
 
     function routeRecordedDestinationConnections() {
@@ -1323,7 +1466,7 @@
             }
 
             try {
-                connectNative(source, graph.gain, entry.outputIndex, 0);
+                connectNative(source, graph.inputAnalyser, entry.outputIndex, 0);
                 entry.routed = true;
             } catch (e) {
                 log(`recorded destination route failed: ${e && e.message}`);
@@ -1357,7 +1500,7 @@
             if (!graph) continue;
 
             try {
-                disconnectNative(source, graph.gain, entry.outputIndex, 0);
+                disconnectNative(source, graph.inputAnalyser, entry.outputIndex, 0);
             } catch (e) {
                 log(`unroute disconnect failed: ${e && e.message}`);
                 continue;
@@ -1369,7 +1512,7 @@
             } catch (e) {
                 log(`unroute reconnect failed: ${e && e.message}`);
                 try {
-                    connectNative(source, graph.gain, entry.outputIndex, 0);
+                    connectNative(source, graph.inputAnalyser, entry.outputIndex, 0);
                     entry.routed = true;
                 } catch (rollbackError) {
                     log(`unroute rollback failed: ${rollbackError && rollbackError.message}`);
@@ -1408,7 +1551,7 @@
         }
 
         try {
-            connectNative(masterGain, graph.gain);
+            connectNative(masterGain, graph.inputAnalyser);
             howlerRoutes.set(masterGain, { context: howler.ctx, graph });
             trackDestinationConnection(masterGain, howler.ctx.destination, undefined, undefined, true);
             log("Howler master gain routed");
@@ -1432,23 +1575,45 @@
         const route = howlerRoutes.get(masterGain);
         if (!route) return;
 
+        const entry = findDestinationConnection(masterGain, howler.ctx.destination, undefined, undefined);
+        // unrouteDestinationConnections runs before this function and already
+        // restored masterGain -> destination when its tracked entry is no
+        // longer marked routed. Do not connect that native path a second time.
+        if (entry && !entry.routed) {
+            howlerRoutes.delete(masterGain);
+            destinationConnections.delete(entry);
+            return;
+        }
+
         const graph = route.graph;
-        if (graph) {
-            try {
-                disconnectNative(masterGain, graph.gain);
-            } catch (e) {
-                log(`Howler unroute disconnect failed: ${e && e.message}`);
-            }
+        if (!graph) {
+            log("Howler master unroute deferred: missing routed graph");
+            return;
+        }
+
+        try {
+            disconnectNative(masterGain, graph.inputAnalyser);
+        } catch (e) {
+            log(`Howler unroute disconnect failed: ${e && e.message}`);
+            return;
         }
 
         try {
             connectNative(masterGain, howler.ctx.destination);
             howlerRoutes.delete(masterGain);
-            const entry = findDestinationConnection(masterGain, howler.ctx.destination, undefined, undefined);
             if (entry) destinationConnections.delete(entry);
             log("Howler master gain unrouted (restored native path)");
         } catch (e) {
             log(`Howler unroute reconnect failed: ${e && e.message}`);
+            // Preserve the original audio route when reconnecting native fails.
+            // Otherwise the Howler master stays detached and the page goes
+            // silent until an unrelated playback event repairs the graph.
+            try {
+                connectNative(masterGain, graph.inputAnalyser);
+                if (entry) entry.routed = true;
+            } catch (rollbackError) {
+                log(`Howler unroute rollback failed: ${rollbackError && rollbackError.message}`);
+            }
         }
     }
 
@@ -1462,8 +1627,10 @@
         }
     }
 
-    function wireMediaRoute(route) {
-        const targetGain = effectiveGain();
+    function setMediaGainValue(route) {
+        const autoGain = state.normalizerEnabled ? dbToGain(route.normalizerGainDb || 0) : 1;
+        const targetGain = route.limiterFallbackActive
+            ? Math.min(1, effectiveGain()) : effectiveGain() * autoGain;
 
         try {
             const now = route.context.currentTime;
@@ -1478,27 +1645,85 @@
         } catch (e) {
             log(`media gain update failed: ${e && e.message}`);
         }
+    }
 
+    function resetMediaBoundaryGain(route) {
+        // Reusing an HTMLMediaElement keeps its previous AudioParam. The
+        // normalizer may have amplified a quiet track significantly. A
+        // 15ms ramp after the next track starts is too late to avoid a short
+        // loud burst, even when the rest of the output is limiter-protected.
+        try {
+            const param = route.gain.gain;
+            const now = route.context.currentTime;
+            const limited = route.outputConnected && !route.limiterFallbackActive &&
+                typeof route.currentMode === "string" && route.currentMode.endsWith("-limited");
+            const manual = effectiveGain();
+            // Never expose positive gain if this path is direct or still
+            // waiting for the limiter to reconnect.
+            const safe = limited ? manual : Math.min(1, manual);
+            param.cancelScheduledValues(now);
+            param.setValueAtTime(Math.max(0, safe), now);
+            return true;
+        } catch (e) {
+            // If we cannot reset a stale boosted AudioParam, disconnect the
+            // route until a future state sync can safely reset it. The reset
+            // flag stays set to guard every attempted reconnection.
+            disconnectMediaRouteOutput(route);
+            log(`source boundary gain reset failed: ${e && e.message}`);
+            return false;
+        }
+    }
+
+    function wireMediaRoute(route) {
+        if (route.sourceGainResetPending) {
+            if (!resetMediaBoundaryGain(route)) return;
+            route.sourceGainResetPending = false;
+        }
+        // A ceiling change is independent of routing/mono/boost mode.
+        configureLimiter(route);
         // Skip the disconnect/reconnect cycle if the routing mode hasn't changed
         // AND the output is still connected. On resume from pause, the output
         // was disconnected by disconnectMediaRouteOutput but currentMode was
         // not cleared, so we must fall through and reconnect.
         const wantMode = currentRoutingMode();
-        if (route.currentMode === wantMode && route.outputConnected) return;
-        route.currentMode = wantMode;
+        if (route.currentMode === wantMode && route.outputConnected && !route.limiterFallbackActive) {
+            setMediaGainValue(route);
+            return;
+        }
+        if (!safetyLimiterRequired() && !clampDirectOutputGain(route)) return;
 
         disconnectMediaRouteOutput(route);
 
         try {
+            const useLimiter = safetyLimiterRequired();
+            const output = useLimiter ? route.limiter : route.context.destination;
             if (state.extensionActive && state.enabled && state.mono) {
-                connectMonoChain(route.gain, route.splitter, route.leftGain, route.rightGain, route.merger, route.context.destination);
+                connectMonoChain(route.gain, route.splitter, route.leftGain, route.rightGain, route.merger, output);
             } else {
-                connectNative(route.gain, route.context.destination);
+                connectNative(route.gain, output);
+            }
+            if (useLimiter) {
+                configureLimiter(route);
+                connectNative(route.limiter, route.analyser);
+                connectNative(route.analyser, route.context.destination);
             }
             route.outputConnected = true;
+            route.currentMode = wantMode;
+            route.limiterFallbackActive = false;
         } catch (e) {
+            route.currentMode = null;
+            disconnectMediaRouteOutput(route);
+            if (clampUnprotectedOutput(route)) {
+                try {
+                    connectNative(route.gain, route.context.destination);
+                    route.outputConnected = true;
+                } catch (fallbackError) {
+                    log(`media route fallback failed: ${fallbackError && fallbackError.message}`);
+                }
+            }
             log(`media graph wire failed: ${e && e.message}`);
         }
+        setMediaGainValue(route);
     }
 
     function ensureMediaRoute(element) {
@@ -1529,32 +1754,51 @@
 
             const source = routeSource.source;
             const gain = markNode(context.createGain());
+            // Measure source RMS before the slider and automatic gain.
+            const inputAnalyser = markNode(context.createAnalyser());
             const splitter = markNode(context.createChannelSplitter(2));
             const leftGain = markNode(context.createGain());
             const rightGain = markNode(context.createGain());
             const merger = markNode(context.createChannelMerger(2));
+            const limiter = markNode(context.createDynamicsCompressor());
+            const analyser = markNode(context.createAnalyser());
 
             gain.channelInterpretation = "speakers";
             leftGain.gain.value = 0.5;
             rightGain.gain.value = 0.5;
+            analyser.fftSize = 1024;
+            analyser.smoothingTimeConstant = 0.35;
+            // 8192 frames span ~171ms at 48kHz, overlapping adjacent
+            // 100ms AGC samples rather than leaving ~15ms peak blind spots.
+            inputAnalyser.fftSize = 8192;
+            inputAnalyser.smoothingTimeConstant = 0.35;
             // Set the gain value BEFORE connecting the source so there is no
             // brief moment of full-volume (gain=1.0) audio at route creation.
             gain.gain.value = effectiveGain();
-            connectNative(source, gain);
+            connectNative(source, inputAnalyser);
+            connectNative(inputAnalyser, gain);
 
             const route = {
                 context,
                 source,
                 gain,
+                inputAnalyser,
                 splitter,
                 leftGain,
                 rightGain,
                 merger,
+                limiter,
+                analyser,
+                normalizerGainDb: 0,
+                meterPeakDb: -Infinity,
+                meterBuffer: new Float32Array(analyser.fftSize),
+                inputBuffer: new Float32Array(inputAnalyser.fftSize),
                 sourceKind: routeSource.kind,
                 muteNative: Boolean(routeSource.muteNative),
                 stream: routeSource.stream || null,
                 outputConnected: false,
-                currentMode: null
+                currentMode: null,
+                limiterFallbackActive: false
             };
             mediaRoutes.set(element, route);
             // The caller restores base/native volume before exposing the route,
@@ -1805,6 +2049,12 @@
                 resetEmePending(element);
                 const route = mediaRoutes.get(element);
                 if (route) {
+                    // A reused HTMLMediaElement keeps its WebAudio route across
+                    // playlist transitions. Do not carry automatic boost from
+                    // a quiet track into the next (potentially loud) track.
+                    route.normalizerGainDb = 0;
+                    route.meterPeakDb = -Infinity;
+                    route.sourceGainResetPending = true;
                     setNativeVolume(element, route.muteNative ? 0 : getMediaState(element).baseVolume);
                     wireMediaRoute(route);
                 } else {
@@ -1897,7 +2147,7 @@
                 if (graph) {
                     const entry = trackDestinationConnection(this, destination, outputIndex, inputIndex, true);
                     try {
-                        connectNative(this, graph.gain, outputIndex, 0);
+                        connectNative(this, graph.inputAnalyser, outputIndex, 0);
                         return destination;
                     } catch (e) {
                         entry.routed = false;
@@ -2354,11 +2604,33 @@
         }
 
         lastHeartbeat = Date.now();
+        const wasNormalizing = state.extensionActive && state.enabled && state.normalizerEnabled;
         state.extensionActive = true;
         state.enabled = data.enabled !== false;
         state.dB = normalizeDb(data.dB);
         state.mono = Boolean(data.mono);
         state.muted = Boolean(data.muted);
+        state.normalizerEnabled = Boolean(data.normalizerEnabled);
+        state.normalizerConfig = normalizeNormalizerConfig(data.normalizerConfig);
+        const nowNormalizing = state.enabled && state.normalizerEnabled;
+        if (wasNormalizing !== nowNormalizing) {
+            // Re-enable at unity gain rather than replaying stale auto gain.
+            // Do this before reconnecting graphs/MediaElementSource nodes.
+            eachTrackedContext((context) => {
+                const graph = graphs.get(context);
+                if (graph) {
+                    graph.normalizerGainDb = 0;
+                    graph.meterPeakDb = -Infinity;
+                }
+            });
+            for (const element of mediaElements) {
+                const route = mediaRoutes.get(element);
+                if (route) {
+                    route.normalizerGainDb = 0;
+                    route.meterPeakDb = -Infinity;
+                }
+            }
+        }
         state.debugMode = Boolean(data.debugMode);
         state.forceDrmCapture = Boolean(data.forceDrmCapture);
         state.forceCorsCapture = Boolean(data.forceCorsCapture);
@@ -2397,6 +2669,8 @@
         state.dB = 0;
         state.mono = false;
         state.muted = false;
+        state.normalizerEnabled = false;
+        state.normalizerConfig = normalizeNormalizerConfig({});
         state.forceDrmCapture = false;
         state.forceCorsCapture = false;
         state.debugRouteMode = "auto";
@@ -2459,7 +2733,153 @@
         setTimeout(suspendMediaContextIfIdle, 0);
     }
 
+
+    function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, config) {
+        // Never amplify the noise floor or reuse stale gain if the analyser
+        // reports silence/errors. This is intentionally independent of the
+        // volume slider so users retain control of the final output level.
+        if (!Number.isFinite(sourceRmsDb) || sourceRmsDb <= -55 ||
+            !Number.isFinite(sourcePeakDb)) return 0;
+
+        const previous = Number.isFinite(previousDb) ? previousDb : 0;
+        // Leave a 2 dB sample-peak margin below the requested compressor
+        // threshold. This reduces sudden overshoot; it is NOT a hard or
+        // inter-sample true-peak guarantee (WebAudio compressors aren't).
+        const rmsTarget = config.targetDb - sourceRmsDb;
+        const peakHeadroom = config.ceilingDb - 2 - sourcePeakDb;
+        const desired = Math.max(-32, Math.min(config.maxBoostDb, rmsTarget, peakHeadroom));
+
+        // Loudness jumps must shed existing boost immediately. Raising gain
+        // is deliberately much slower to avoid pumping from brief quiet gaps.
+        if (desired <= previous) return desired;
+        const alpha = 1 - Math.exp(-100 / Math.max(100, config.responseMs));
+        return previous + (desired - previous) * alpha;
+    }
+
+    function sampleProcessor(processor) {
+        if (!processor || !processor.analyser || !processor.context || processor.context.state !== "running") {
+            return { peakDb: -Infinity, gainDb: processor && Number(processor.normalizerGainDb) || 0 };
+        }
+        const analyser = processor.analyser;
+        if (!processor.meterBuffer || processor.meterBuffer.length !== analyser.fftSize) {
+            processor.meterBuffer = new Float32Array(analyser.fftSize);
+        }
+        try {
+            analyser.getFloatTimeDomainData(processor.meterBuffer);
+        } catch (e) {
+            return { peakDb: -Infinity, gainDb: Number(processor.normalizerGainDb) || 0 };
+        }
+
+        let peak = 0;
+        for (let i = 0; i < processor.meterBuffer.length; i++) {
+            const sample = processor.meterBuffer[i];
+            const abs = Math.abs(sample);
+            if (abs > peak) peak = abs;
+        }
+
+        const peakDb = peak > 0.000001 ? 20 * Math.log10(peak) : -Infinity;
+        processor.meterPeakDb = peakDb;
+
+        // The output analyser supplies peak metering only; source RMS feeds AGC.
+        // Otherwise moving the user's slider changes detected loudness and
+        // the normalizer gradually cancels their requested gain adjustment.
+        let sourceRmsDb = -120;
+        let sourcePeakDb = -Infinity;
+        const sourceAnalyser = processor.inputAnalyser;
+        if (sourceAnalyser) {
+            if (!processor.inputBuffer || processor.inputBuffer.length !== sourceAnalyser.fftSize) {
+                processor.inputBuffer = new Float32Array(sourceAnalyser.fftSize);
+            }
+            try {
+                sourceAnalyser.getFloatTimeDomainData(processor.inputBuffer);
+                let sourceSum = 0;
+                let sourcePeak = 0;
+                for (let i = 0; i < processor.inputBuffer.length; i++) {
+                    const sample = processor.inputBuffer[i];
+                    sourceSum += sample * sample;
+                    sourcePeak = Math.max(sourcePeak, Math.abs(sample));
+                }
+                const sourceRms = Math.sqrt(sourceSum / Math.max(1, processor.inputBuffer.length));
+                sourceRmsDb = sourceRms > 0.000001 ? 20 * Math.log10(sourceRms) : -120;
+                sourcePeakDb = sourcePeak > 0.000001 ? 20 * Math.log10(sourcePeak) : -Infinity;
+            } catch (e) {}
+        }
+        const config = normalizeNormalizerConfig(state.normalizerConfig);
+        let gainDb = Number(processor.normalizerGainDb) || 0;
+        const previousGainDb = gainDb;
+        if (state.normalizerEnabled && state.extensionActive && state.enabled && !state.muted &&
+            !processor.limiterFallbackActive) {
+            gainDb = computeSafeNormalizerGainDb(gainDb, sourceRmsDb, sourcePeakDb, config);
+        } else {
+            gainDb = 0;
+        }
+
+        if (Math.abs(gainDb) < 0.01) gainDb = 0;
+        processor.normalizerGainDb = gainDb;
+        configureLimiter(processor);
+
+        try {
+            const now = processor.context.currentTime;
+            const target = processor.limiterFallbackActive
+                ? Math.min(1, effectiveGain())
+                : effectiveGain() * (state.normalizerEnabled ? dbToGain(gainDb) : 1);
+            processor.gain.gain.cancelScheduledValues(now);
+            processor.gain.gain.setTargetAtTime(target, now, gainDb < previousGainDb ? 0.008 : 0.035);
+        } catch (e) {}
+
+        return { peakDb, gainDb };
+    }
+
+    function updateNormalizerAndMeter() {
+        if (!state.normalizerEnabled) return;
+        let peakDb = -Infinity;
+        let gainDb = 0;
+        let gainCount = 0;
+
+        eachTrackedContext((context) => {
+            const graph = graphs.get(context);
+            if (!graph) return;
+            const sample = sampleProcessor(graph);
+            if (Number.isFinite(sample.peakDb)) peakDb = Math.max(peakDb, sample.peakDb);
+            if (Number.isFinite(sample.gainDb)) {
+                gainDb += sample.gainDb;
+                gainCount++;
+            }
+        });
+
+        for (const element of Array.from(mediaElements)) {
+            const route = mediaRoutes.get(element);
+            if (!route || !route.outputConnected) continue;
+            const sample = sampleProcessor(route);
+            if (Number.isFinite(sample.peakDb)) peakDb = Math.max(peakDb, sample.peakDb);
+            if (Number.isFinite(sample.gainDb)) {
+                gainDb += sample.gainDb;
+                gainCount++;
+            }
+        }
+
+        postToContentScript("meterUpdate", {
+            peakDb,
+            normalizerGainDb: gainCount ? gainDb / gainCount : 0
+        });
+    }
+
+    function syncNormalizerMeterTimer() {
+        const shouldRun = state.extensionActive && state.enabled && state.normalizerEnabled;
+        if (!shouldRun) {
+            if (normalizerMeterTimerId !== null) clearInterval(normalizerMeterTimerId);
+            normalizerMeterTimerId = null;
+            return;
+        }
+        if (normalizerMeterTimerId === null) {
+            normalizerMeterTimerId = setInterval(updateNormalizerAndMeter, 100);
+        }
+    }
+
     function startMaintenanceTimers() {
+        // Called on every state sync; update the meter separately even when
+        // the lower-frequency maintenance timers are already installed.
+        syncNormalizerMeterTimer();
         if (!state.extensionActive || !state.enabled || maintenanceTimerIds.length) return;
 
         let howlerPollCount = 0;
@@ -2488,6 +2908,8 @@
     }
 
     function stopMaintenanceTimers() {
+        if (normalizerMeterTimerId !== null) clearInterval(normalizerMeterTimerId);
+        normalizerMeterTimerId = null;
         for (const id of maintenanceTimerIds) clearInterval(id);
         maintenanceTimerIds = [];
         if (howlerPollId !== null) {

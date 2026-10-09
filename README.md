@@ -12,13 +12,45 @@
 
 Volume Control adds a simple per-site volume control to your browser. It can lower volume, boost HTML5 audio and video above the normal browser limit, and optionally play stereo audio as mono. The extension is useful for quiet videos, uneven site volume, embedded players, and pages that do not provide enough audio control on their own.
 
-Settings can be remembered per site or URL path, including volume, mono, mute, and optional debug overrides; you can also exclude sites where you do not want the extension to run. Whitelist authorization is independent from remembered audio settings: an allowed site can run with Remember off, giving each tab its own ephemeral state and resetting non-remembered state when SPA navigation moves to a new page/video URL. Volume Control supports HTML5 video and audio only; it does not support Flash.
+Settings can be remembered per site or URL path, including volume, mono, mute, and optional debug overrides; you can also exclude sites where you do not want the extension to run. Whitelist authorization is independent from remembered audio settings: with Remember off, each tab keeps its own unsaved volume, mono and mute through playlists and single-page-app navigation; a new tab or full reload starts from defaults. Remember only controls saving settings across sessions. Volume Control supports HTML5 video and audio only; it does not support Flash.
 
 Excluded-site entries match by domain, and entries saved **with a path** (such as the legacy V4-era defaults) are wildcard-matched against the full URL — so `www.twitch.tv/*/clip/*` excludes only the clip pages while the rest of Twitch runs. A one-time v6.13 migration removes the legacy Twitch default entries that older builds left in users' stored storage (path and `www.` normalization had turned them into a block on the whole domain — issue #69), and the popup's Active toggle now removes **every** entry that blocks the current page — not just the exact domain match — with a tooltip explaining what it removed. Since v6.14 the **options page also accepts user-typed paths**, so path-scoped exclusions are a first-class feature (`example.com/videos`, wildcards with `*` = any characters except `/` — see the options-page hint); the legacy purge now also runs at install/update/startup so a hand-added path entry can never be swept by a migration that has not run yet. Since v6.15 the popup **tells you when the current page is blocklisted** — an overlay message (styled like the DRM note) names the matching entry and how to re-enable the site, on every engine — and the options-page blocklist input accepts **Enter** to add an entry, with an inline notice when the typed site/wildcard is already in the list.
 
 **Compatibility:** Firefox 128+ (event-page background) and Chromium 121+ — Chrome, Edge, Brave, Opera, Vivaldi from January 2024 onward (service-worker background). Chromium 120 and older rejects the cross-browser manifest shape at load time, so the manifest declares `minimum_chrome_version: "121"`.
 
 Media that cannot be boosted (DRM-protected or cross-origin streams) is detected automatically: the popup explains the restriction, the slider clamps at 0 dB, and lowering volume still works through the native fallback. See [Restricted Media](#restricted-media-drm--cross-origin) below. On Firefox, DRM audio **can** be boosted — see the engine note below.
+
+
+## Normalization, Manual Volume, and Peak Meter (6.23+)
+
+**Normalize is opt-in and OFF by default.** Enable it for the current site/path using the **Normalize** switch in the popup. The live **Gain** readout and **output peak meter** expand only when that site's switch is on; they fold away when it is off. In **Options → Normalizer**, **Normalize by default on sites without an override** controls the global default, and the target/boost/ceiling/response fields are folded away when the global default is off. A site-specific choice overrides the global default and is saved **separately** in `siteNormalizerSettings`; it does not require **Remember** and does not overwrite remembered volume, mute or mono.
+
+### Signal flow
+
+For supported WebAudio routes the MAIN-world page/MediaElement graph and ISOLATED-world fallback follow this signal chain:
+
+```text
+Audio source
+   |-- input analyser (source RMS and sample peaks, 8192 samples)
+   v
+Extension gain (manual slider × automatic gain, independent controls)
+   v
+Optional mono mixing
+   v
+Safety compressor when Normalize is on or manual boost is positive
+   v
+Output analyser (post-compressor sampled peak) → speakers
+```
+
+- **Input analysis / automatic gain:** measures RMS *before* the extension's gain. The controller targets **−16 dBFS RMS** by default and does not adjust against the slider-adjusted output. Reducing the slider by −20 dB therefore retains approximately −20 dB of *relative* attenuation at the same source loudness, except when compression/limiting makes the output response nonlinear.
+- **Safety guards:** source RMS at or below **−55 dBFS** is treated as near-silence; automatic gain is reset to unity so background noise does not attract a large boost. Invalid or missing detector readings also fail to unity. When above the gate, automatic gain is bounded by the **Maximum auto boost** (+12 dB default, configurable up to +24 dB), and by measured source sample-peak headroom (approximately **2 dB below the configured compressor threshold**, *before* the manual slider's gain). A detected loudness jump reduces auto gain quickly; increasing gain follows the configured response time (600 ms default). Input analyser windows contain 8,192 samples (roughly 171 ms at 48 kHz) and are checked about every 100 ms, reducing gaps in transient detection.
+- **Manual volume:** the −32…+32 dB slider applies a separate multiplier *after the source analysis*. Normalization does not increase gain just because you lower the slider. **Positive manual boost is not part of the source-only peak headroom budget** and can trigger substantial compressor reduction; +20 dB does not necessarily mean +20 dB more perceived loudness.
+- **Compressor and peaks:** the WebAudio `DynamicsCompressorNode` processes audio when Normalize is on or manual boost is positive. With Normalize off and no positive boost, the output bypasses it where possible. The default **Limiter ceiling** field sets a **−1 dBFS compressor threshold**, **not** a guaranteed hard ceiling: this is **not** a look-ahead brick-wall true-peak limiter. Sudden attacks, inter-sample peaks, compressor latency, and large manual boosts can still clip or sound distorted.
+- **Output meter and lifecycle:** the live meter displays sampled post-processor **sample peaks** in dBFS, **not** true peaks, LUFS or integrated perceived loudness. The Gain number describes *automatic* gain, not the manual slider value. Normalize enable/disable and reused-media source boundaries clear prior automatic gain; the 100 ms sampling timers stop when Normalize is off.
+
+### Unsupported media and practical limits
+
+DRM-restricted streams on Chromium, cross-origin media without suitable CORS permission, and **Force native** mode cannot use WebAudio normalization; native attenuation/mute still works. A site can have its own audio processing, and some pages combine multiple players in one graph. The input analyser cannot predict sound that has not arrived yet, so sudden loud transients can still be heard before the compressor fully reacts. **Start at a low volume**, especially if you select the +24 dB maximum auto boost; reduce manual boost or disable Normalize if you hear level jumps, pumping, or distortion.
 
 ## Restricted Media (DRM & Cross-Origin)
 
@@ -62,6 +94,7 @@ Some media cannot be routed through WebAudio, and whether that applies depends o
 - Sites that create their own `createMediaElementSource` pipeline for the same element can end up double-attenuating when Volume Control also routes that element.
 - Media that becomes cross-origin-tainted *after* it was already routed cannot be un-tainted; routing continues with the gain that was already applied.
 - Sites with unusual, heavily customized, or late-changing WebAudio graphs may not be fully controllable in every playback path.
+- Normalization is based on source RMS and sample peaks, **not LUFS or inter-sample true peak**. The compressor is not a brick-wall hard limiter. Fast transients and large manual boosts may still clip; see [Normalization, Manual Volume, and Peak Meter](#normalization-manual-volume-and-peak-meter-623).
 
 ## Release Builds (read this before packaging)
 
@@ -139,6 +172,8 @@ AMO/Chrome Web Store review note: the broad host access, early `document_start` 
 # Changelog
 
 ## Changes since 6.11 (through 6.23)
+
+**Post-6.23 updates on `master`:** opt-in Normalize per site/path and a separately controlled global default; collapsible popup meter/Options controls; pre-fader source analysis independent of the slider; noise-floor gate, peak-aware automatic boost headroom and faster gain reduction; sampled output peak meter; and CPU-saving compressor/timer bypasses while disabled. See [signal flow](#signal-flow) and [limitations](#unsupported-media-and-practical-limits).
 
 These updates improve Firefox media compatibility, restore volume after track changes, add path-based site exclusions and per-site debug profiles, and harden release-build minification. See the [full source comparison](https://github.com/Chaython/volumecontrol/compare/V6.11...master).
 
@@ -408,8 +443,8 @@ Planned features: Added to Chrome Web Store. [Looking for donations, to buy chro
 | `page-audio-hook.js` | **MAIN world** content script | ✅ Page's `window` | ❌ | ✅ **Yes** | Patches `AudioNode.prototype.connect`, `HTMLMediaElement.prototype.volume`, `HTMLMediaElement.prototype.play`, `window.Audio`, `document.createElement`, `setMediaKeys`/`requestMediaKeySystemAccess` (EME detection) to insert gain nodes into the page's audio graph and track every media element (attached, detached, or shadow-DOM) | **Must** run in MAIN world — prototype patches only affect code in the same JS realm; extension APIs are stripped from MAIN world for security |
 | `cs.js` | **ISOLATED world** content script | ✅ Clean `window` | ✅ | ❌ | Content script bridge — reads/writes `chrome.storage`, handles messages from popup/background (top-frame targeted), syncs state to `page-audio-hook.js` via `window.postMessage`, computes the boost-limit verdict (DRM/cross-origin) including the hook's aggregate flag and iframe reports, manages fallback volume for cross-origin/DRM media | **Must** run in ISOLATED world to access `chrome.storage` and `chrome.runtime` APIs; communicates with MAIN world via `postMessage` |
 | `background.js` | **Background** (Chrome: service worker / Firefox: event page) | ❌ No DOM | ✅ | ❌ | Handles keyboard shortcuts (`Alt+Shift+Up`/`Down`/`0`/`M`), shows native volume feedback badge, serializes remembered-setting writes and blocklist/whitelist mutations | Runs globally (not per-tab), has no DOM access, gets killed when idle; can't be merged with page-context scripts. Loads `shared.js` via `importScripts` in the service-worker world and via the manifest's `scripts` array on Firefox (dual-key background) |
-| `popup.js` | **Popup page** (`popup.html`) | ✅ Own DOM | ✅ | ❌ | Popup UI logic — volume slider, mono toggle, remember-site checkbox, enable/disable switch, restriction note ("restricted by DRM"), debounced storage writes, focus management for accessibility, 1 s state polling while open (never touches the slider mid-drag) | Runs in `popup.html`'s isolated DOM; separate from options page because popup logic and options logic have no overlapping DOM concerns |
-| `options.js` | **Options page** (`options.html`) | ✅ Own DOM | ✅ | ❌ | Options UI logic — blocklist/whitelist management, remembered-sites editor, debug mode toggle, live storage sync | Runs in `options.html`'s isolated DOM; separate from popup because it manages different UI with different lifecycle (stays open vs. closes on action) |
+| `popup.js` | **Popup page** (`popup.html`) | ✅ Own DOM | ✅ | ❌ | Popup UI logic — volume slider, Normalize toggle and folded output meter, mono toggle, remember-site checkbox, enable/disable switch, restriction note ("restricted by DRM"), debounced storage writes, focus management for accessibility, 1 s state polling while open (never touches the slider mid-drag) | Runs in `popup.html`'s isolated DOM; separate from options page because popup logic and options logic have no overlapping DOM concerns |
+| `options.js` | **Options page** (`options.html`) | ✅ Own DOM | ✅ | ❌ | Options UI logic — global normalization default and advanced settings, blocklist/whitelist management, remembered-sites editor, debug mode toggle, live storage sync | Runs in `options.html`'s isolated DOM; separate from popup because it manages different UI with different lifecycle (stays open vs. closes on action) |
 | `manifest.json` | Extension manifest | — | — | — | Declares permissions, content scripts (with world specification), the dual-key background (service worker for Chrome 121+ + scripts for Firefox event pages) plus the `minimum_chrome_version: "121"` floor, action popup, options page, keyboard commands, Firefox compatibility | Defines which scripts load in which world; the only place where the MAIN/ISOLATED split and the cross-browser background shape are configured |
 | `popup.html` | Popup document | ✅ | — | ❌ | Popup markup — volume slider, mono/remember/active toggles, settings button, exclusion message, restriction note, error display | Required entry point for `browser.action.default_popup` |
 | `popup.css` | Popup styles | — | — | — | Popup styling — slider, switches, layout, dark mode support | Keeps presentation separate from popup logic |
