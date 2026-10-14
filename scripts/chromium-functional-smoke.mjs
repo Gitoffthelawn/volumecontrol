@@ -84,8 +84,19 @@ try {
         'const ctx=new AudioContext();const o=ctx.createOscillator();const g=ctx.createGain();' +
         'g.gain.value=0.05;o.connect(g);g.connect(ctx.destination);await ctx.resume();' +
         'o.start();window.vcTone={ctx,o,g};return ctx.state;};</script>';
+    // Same-origin browser-only AudioWorklet experiment: this validates
+    // processor module loading and real 128-frame render quanta without
+    // adding CSP/permissions/worklet code to the shipped extension.
+    const truePeakCore = readFileSync(new URL('./true-peak-lookahead.mjs', import.meta.url), 'utf8');
+    const truePeakWorklet = "import { LookaheadTruePeakLimiter } from '/true-peak-core.mjs';\nclass VcTruePeakPrototype extends AudioWorkletProcessor {\n  constructor() {\n    super();\n    this.limiter = new LookaheadTruePeakLimiter({ sampleRate, channels: 2 });\n  }\n  process(inputs, outputs) {\n    const input = inputs[0], output = outputs[0];\n    if (!input || input.length !== 2 || !output || output.length !== 2) {\n      for (const channel of output || []) channel.fill(0);\n      return true;\n    }\n    this.limiter.processInto(input, output);\n    return true;\n  }\n}\nregisterProcessor('vc-true-peak-prototype', VcTruePeakPrototype);";
     server = createServer((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' }); res.end(html);
+        if (req.url === '/true-peak-core.mjs' || req.url === '/true-peak-worklet.mjs') {
+            res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(req.url === '/true-peak-core.mjs' ? truePeakCore : truePeakWorklet);
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' });
+        res.end(html);
     });
     await new Promise((resolve, reject) => {
         server.once('error', reject); server.listen(0, '127.0.0.1', resolve);
@@ -153,6 +164,33 @@ try {
     await send({ command: 'setNormalizer', enabled: true });
     check('Normalize enabled', (await state())?.normalizerEnabled === true);
     check('Real WebAudio oscillator running', await cdp.eval(tabSession, 'window.startTone()') === 'running');
+    // Probe the *packaged* extension-origin module in a page-owned
+    // AudioContext. Failure is explicitly reported, not silently treated as
+    // proof that an extension-origin worklet can protect page audio.
+    const extensionWorkletUrl = 'chrome-extension://' + id + '/true-peak-worklet.js';
+    const extensionProbeExpr = "(async () => {\n    const ctx = new OfflineAudioContext(2, 4096, 48000);\n    if (!ctx.audioWorklet) return { available: false, reason: 'no-audio-worklet-api' };\n    try {\n        await ctx.audioWorklet.addModule(WORKLET_URL);\n        const buffer = ctx.createBuffer(2, 4096, 48000);\n        for (let i = 0; i < 3000; i++) {\n            const sample = 1.2 * Math.sin(i * Math.PI / 2 + Math.PI / 4);\n            buffer.getChannelData(0)[i] = sample;\n            buffer.getChannelData(1)[i] = -sample;\n        }\n        const source = ctx.createBufferSource();\n        const limiter = new AudioWorkletNode(ctx, 'volume-control-true-peak', {\n            numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],\n            channelCount: 2, channelCountMode: 'explicit',\n            processorOptions: { channels: 2 }\n        });\n        source.buffer = buffer;\n        source.connect(limiter);\n        limiter.connect(ctx.destination);\n        source.start();\n        const rendered = await ctx.startRendering();\n        const left = rendered.getChannelData(0), right = rendered.getChannelData(1);\n        let peak = 0, rms = 0, balance = 0;\n        for (let i = 0; i < left.length; i++) {\n            peak = Math.max(peak, Math.abs(left[i]), Math.abs(right[i]));\n            balance = Math.max(balance, Math.abs(left[i] + right[i]));\n            rms += left[i] * left[i];\n        }\n        return { available: true, peak, rms: Math.sqrt(rms / left.length), balance };\n    } catch (error) {\n        return { available: false, reason: String(error?.name || 'Error') +\n            ': ' + String(error?.message || error).slice(0, 200) };\n    }\n})()".replace('WORKLET_URL', JSON.stringify(extensionWorkletUrl));
+    const extensionHostProbe = await cdp.eval(settingsSession, extensionProbeExpr);
+    check('Packaged true-peak module loads in an extension-owned AudioWorklet',
+        extensionHostProbe?.available === true &&
+        extensionHostProbe.rms > 0.1 && extensionHostProbe.peak < 0.89 &&
+        extensionHostProbe.balance < 1e-5, extensionHostProbe);
+    const extensionWorkletProbe = await cdp.eval(tabSession, extensionProbeExpr);
+    check('Packaged true-peak worklet compatibility probe completed',
+        extensionWorkletProbe && (extensionWorkletProbe.available === true ||
+        typeof extensionWorkletProbe.reason === 'string'), extensionWorkletProbe);
+    console.log('PACKAGED WORKLET CAPABILITY: ' + JSON.stringify(extensionWorkletProbe));
+    if (extensionWorkletProbe.available) {
+        check('Packaged extension-origin worklet renders bounded stereo audio',
+            extensionWorkletProbe.rms > 0.1 && extensionWorkletProbe.peak < 0.89 &&
+            extensionWorkletProbe.balance < 1e-5, extensionWorkletProbe);
+    }
+    const workletResult = await cdp.eval(tabSession, "(async () => {\n    const rate = 48000, length = 6144;\n    const context = new OfflineAudioContext(2, length, rate);\n    if (!context.audioWorklet) throw Error('OfflineAudioContext.audioWorklet missing');\n    await context.audioWorklet.addModule('/true-peak-worklet.mjs');\n    const source = context.createBufferSource();\n    const buffer = context.createBuffer(2, length, rate);\n    for (let n = 0; n < length - 1024; n++) {\n        const sample = 1.2 * Math.sin(n * Math.PI / 2 + Math.PI / 4);\n        buffer.getChannelData(0)[n] = sample;\n        buffer.getChannelData(1)[n] = -sample;\n    }\n    source.buffer = buffer;\n    const limiter = new AudioWorkletNode(context, 'vc-true-peak-prototype',\n        { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],\n          channelCount: 2, channelCountMode: 'explicit' });\n    source.connect(limiter);\n    limiter.connect(context.destination);\n    source.start();\n    const rendered = await context.startRendering();\n    const left = rendered.getChannelData(0), right = rendered.getChannelData(1);\n    let samplePeak = 0, difference = 0, rms = 0;\n    for (let n = 0; n < left.length; n++) {\n        samplePeak = Math.max(samplePeak, Math.abs(left[n]), Math.abs(right[n]));\n        difference = Math.max(difference, Math.abs(left[n] + right[n]));\n        rms += left[n] * left[n];\n    }\n    return { samplePeak, difference, rms: Math.sqrt(rms / left.length),\n        beginsWithSilence: left.slice(0, 128).every(x => x === 0) };\n})()");
+    check('Offline AudioWorklet loads true-peak prototype and emits nonzero music',
+        workletResult && workletResult.rms > 0.15, workletResult);
+    check('Lookahead prototype attenuates sample peaks and preserves stereo in real Chromium DSP',
+        workletResult.samplePeak < 0.89 && workletResult.difference < 1e-5 &&
+        workletResult.beginsWithSilence, workletResult);
+
     await sleep(250);
     const meter = (await send({ command: 'getMeterState' }))?.response;
     check('Normalizer meter responds', meter?.normalizerEnabled === true && Object.hasOwn(meter, 'peakDb'), meter);
@@ -174,6 +212,22 @@ try {
         '(async()=> (await vcTest.get("normalizerDefaultEnabled")).normalizerDefaultEnabled === false && ' +
         'document.getElementById("normalizer-options-details").hidden)()'));
     check('Options global normalize toggle folds when off', true);
+    check('Experimental true-peak is off on fresh options',
+        await cdp.eval(settingsSession,
+        'document.getElementById("normalizerTruePeakExperimental")?.checked === false'));
+    await cdp.eval(settingsSession,
+        '(()=>{const e=document.getElementById("normalizerTruePeakExperimental");e.checked=true;' +
+        'e.dispatchEvent(new Event("change",{bubbles:true}));return true})()');
+    await waitFor(async () => await cdp.eval(settingsSession,
+        '(async()=> (await vcTest.get("normalizerConfig")).normalizerConfig?.experimentalTruePeak === true)()'));
+    check('Experimental true-peak setting persists without changing audio route', true);
+    await cdp.eval(settingsSession,
+        '(()=>{const e=document.getElementById("normalizerTruePeakExperimental");e.checked=false;' +
+        'e.dispatchEvent(new Event("change",{bubbles:true}));return true})()');
+    await waitFor(async () => await cdp.eval(settingsSession,
+        '(async()=> (await vcTest.get("normalizerConfig")).normalizerConfig?.experimentalTruePeak === false)()'));
+    check('Experimental true-peak opt-out restores saved default', true);
+
     const commands = await cdp.eval(settingsSession,
         'new Promise((ok,fail)=>chrome.commands.getAll(v=>chrome.runtime.lastError?' +
         'fail(Error(chrome.runtime.lastError.message)):ok(v.map(x=>x.name))))');

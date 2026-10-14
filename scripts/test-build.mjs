@@ -5,6 +5,8 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, test } from 'node:test';
 import { runInNewContext, Script } from 'node:vm';
+import { estimateInterSamplePeaks } from './audio-peak-lab.mjs';
+import { LookaheadTruePeakLimiter } from './true-peak-lookahead.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dist = join(root, 'dist');
@@ -19,6 +21,8 @@ after(() => {
 mkdirSync(join(fixtureRoot, 'scripts'));
 copyFileSync(join(root, 'scripts/build.ps1'), join(fixtureRoot, 'scripts/build.ps1'));
 copyFileSync(join(root, 'scripts/minify.mjs'), join(fixtureRoot, 'scripts/minify.mjs'));
+copyFileSync(join(root, 'scripts/bundle-true-peak.mjs'), join(fixtureRoot, 'scripts/bundle-true-peak.mjs'));
+copyFileSync(join(root, 'scripts/true-peak-lookahead.mjs'), join(fixtureRoot, 'scripts/true-peak-lookahead.mjs'));
 const assets = readdirSync(root).filter(name => /\.(js|html|css)$/.test(name) || name === 'LICENSE');
 for (const name of [...assets, 'manifest.json', 'ico.svg', 'chrome.png']) {
     copyFileSync(join(root, name), join(fixtureRoot, name));
@@ -60,12 +64,18 @@ for (const browser of ['chrome', 'firefox']) {
             assert.equal('scripts' in packageManifest.background, false);
             assert.equal('browser_specific_settings' in packageManifest, false);
             assert.deepEqual(packageManifest.icons, { '128': 'chrome.png' });
+            assert.deepEqual(packageManifest.web_accessible_resources, [{
+                resources: ['true-peak-worklet.js'], matches: ['<all_urls>']
+            }]);
         } else {
             assert.equal('minimum_chrome_version' in packageManifest, false);
             assert.equal('service_worker' in packageManifest.background, false);
             assert.deepEqual(packageManifest.background.scripts, ['shared.js', 'background.js']);
             assert.ok(packageManifest.browser_specific_settings?.gecko);
             assert.deepEqual(packageManifest.icons, { '96': 'ico.svg' });
+            assert.deepEqual(packageManifest.web_accessible_resources, [{
+                resources: ['true-peak-worklet.js'], matches: ['<all_urls>']
+            }]);
         }
     });
 
@@ -76,7 +86,7 @@ for (const browser of ['chrome', 'firefox']) {
             'dist',
             `volume-control-${browser}-v${baseManifest.version}.zip`
         );
-        const expected = [...assets, 'build-regression.js', 'manifest.json', icon].sort();
+        const expected = [...assets, 'true-peak-worklet.js', 'build-regression.js', 'manifest.json', icon].sort();
         assert.deepEqual(listZipEntries(zipPath), expected);
     });
 
@@ -89,6 +99,15 @@ for (const browser of ['chrome', 'firefox']) {
         assert.equal(context.buildRegression.template, 'outer inner https://example.com');
         assert.equal(context.buildRegression.multiline, 'first\n\nlast');
         assert.equal(context.buildRegression.unicode, '× − → café 🎵');
+    });
+
+    test(`${browser}: packaged experimental worklet is self-contained`, () => {
+        const code = readFileSync(join(packageDir, 'true-peak-worklet.js'), 'utf8');
+        assert.match(code, /volume-control-true-peak/);
+        assert.match(code, /LookaheadTruePeakLimiter/);
+        assert.doesNotMatch(code, /\bimport\s*\{/);
+        assert.doesNotMatch(code, /\bexport\s+class/);
+        assert.match(code, /limiter-error/);
     });
 
     test(`${browser}: JavaScript is minified without changing source files`, () => {
@@ -332,13 +351,122 @@ test('moving volume slider cannot cause the isolated-world normalizer to compens
 });
 
 
+test('offline 4x FIR peak lab catches inter-sample overs and stereo cancellation', () => {
+    const frames = 2048;
+    // A quarter-sample-shifted Nyquist/2 tone measures ~-1.4 dBFS at
+    // discrete sample locations even when its reconstructed peaks exceed 0.
+    const signal = Float64Array.from({ length: frames },
+        (_, n) => 1.2 * Math.sin(n * Math.PI / 2 + Math.PI / 4));
+    const inverted = Float64Array.from(signal, x => -x);
+    const result = estimateInterSamplePeaks([signal, inverted]);
+    assert.equal(result.oversamplingFactor, 4);
+    assert.equal(result.compliantTruePeakMeter, false,
+        'the offline diagnostic is not certified to BS.1770');
+    assert.ok(result.samplePeak < 1, 'all actual PCM samples are below full scale');
+    assert.ok(result.interpolatedPeak > 1.1,
+        'reconstructed waveform peaks above full-scale between samples');
+    assert.ok(result.interSampleOvershootDb > 2,
+        'the per-channel estimate should expose multi-dB inter-sample overs');
+    assert.ok(Math.abs(result.channels[0].interpolatedPeak -
+        result.channels[1].interpolatedPeak) < 1e-10,
+        'opposite-phase channels must not cancel in the peak detector');
+    const silent = estimateInterSamplePeaks([new Float32Array(128)]);
+    assert.equal(silent.samplePeak, 0);
+    assert.equal(silent.interpolatedPeak, 0);
+    assert.equal(silent.samplePeakDb, -Infinity);
+    assert.throws(() => estimateInterSamplePeaks([
+        new Float32Array([0, 1]), new Float32Array([0])
+    ]), /same non-zero frame length/);
+    assert.throws(() => estimateInterSamplePeaks([new Float32Array([NaN, 1])]),
+        /Non-finite PCM sample/);
+    const pcm = Float32Array.from([0.2, -0.7, 0.5, -0.2]);
+    const before = Array.from(pcm);
+    estimateInterSamplePeaks([pcm]);
+    assert.deepEqual(Array.from(pcm), before, 'analysis must not modify audio');
+});
+
+test('lookahead prototype bounds inter-sample over without flattening channel balance', () => {
+    for (const sampleRate of [44100, 48000, 96000]) {
+        const frames = 4096;
+        const testInput = Float32Array.from({ length: frames },
+            (_, n) => 1.2 * Math.sin(n * Math.PI / 2 + Math.PI / 4));
+        const first = new Float32Array(frames + 2048);
+        first.set(testInput);
+        const second = Float32Array.from(first, value => -value);
+        const before = estimateInterSamplePeaks([first, second]);
+        assert.ok(before.samplePeak < 1 && before.interpolatedPeak > 1.1);
+        const limiter = new LookaheadTruePeakLimiter({ sampleRate, channels: 2 });
+        const out = limiter.process([first, second]);
+        const after = estimateInterSamplePeaks(out);
+        assert.ok(after.interpolatedPeakDb < -0.9,
+            `lookahead should keep reconstructed musical peaks beneath -0.9 dBFS at ${sampleRate} Hz: ${after.interpolatedPeakDb}`);
+        assert.ok(limiter.maximumDetectedPeak > 1.1);
+        assert.equal(limiter.maximumInputSample < 1, true);
+        for (let i = 0; i < 100; i++) {
+            assert.equal(out[0][i], 0, 'output begins with lookahead silence');
+        }
+        for (let i = limiter.delaySamples; i < out[0].length; i++) {
+            assert.ok(Math.abs(out[0][i] + out[1][i]) < 1e-6,
+                'linked gain must preserve anti-phase stereo balance');
+        }
+    }
+});
+
+test('lookahead prototype remains bit-identical across audio quantum boundaries', () => {
+    const frames = 8192;
+    const input = Float32Array.from({ length: frames }, (_, n) => {
+        const envelope = n < 1000 ? 0 : n < 2500 ? 2.4 : n < 3400 ? 0.03 : 1.1;
+        return envelope * Math.sin(n * 0.04 + 0.7);
+    });
+    const opts = { channels: 1, sampleRate: 48000, ceilingDb: -1 };
+    const allAtOnce = new LookaheadTruePeakLimiter(opts).process([input])[0];
+    const streaming = new LookaheadTruePeakLimiter(opts);
+    const streamed = new Float32Array(frames);
+    for (let start = 0; start < frames; start += 128) {
+        const segment = input.subarray(start, Math.min(start + 128, frames));
+        const result = new Float32Array(segment.length);
+        const written = streaming.processInto([segment], [result]);
+        assert.equal(written[0], result, 'processInto must use preallocated output');
+        streamed.set(result, start);
+    }
+    assert.deepEqual(streamed, allAtOnce, 'state must survive AudioWorklet 128-frame blocks');
+    const truePeak = estimateInterSamplePeaks([streamed]);
+    assert.ok(truePeak.interpolatedPeakDb < -0.7,
+        `crest-factor changes should remain under the safety reference: ${truePeak.interpolatedPeakDb}`);
+    streaming.reset();
+    assert.equal(streaming.position, 0);
+    assert.equal(streaming.gain, 1);
+    const afterReset = streaming.process([new Float32Array(512)])[0];
+    assert.ok(afterReset.every(x => x === 0), 'stream reset cannot replay stale audio');
+});
+
+test('lookahead prototype rejects malformed frames before they leak into future blocks', () => {
+    const limiter = new LookaheadTruePeakLimiter({ sampleRate: 48000, channels: 2 });
+    assert.throws(() => limiter.process([new Float32Array(10)]), /configured number/);
+    assert.throws(() => limiter.process([new Float32Array(5), new Float32Array(4)]),
+        /equal, non-zero lengths/);
+    assert.throws(() => limiter.processInto(
+        [new Float32Array(10), new Float32Array(10)],
+        [new Float32Array(10), new Float32Array(9)]),
+        /matching all input channels/);
+    const same = new Float32Array(128);
+    assert.throws(() => limiter.processInto([same, new Float32Array(128)],
+        [same, new Float32Array(128)]), /separate output PCM buffers/);
+
+    assert.throws(() => limiter.process([new Float32Array([NaN]), new Float32Array([0])]),
+        /Non-finite PCM/);
+    assert.equal(limiter.position, 0, 'invalid PCM resets any buffered output');
+    assert.throws(() => new LookaheadTruePeakLimiter({ sampleRate: 1000 }), /sampleRate/);
+    assert.throws(() => new LookaheadTruePeakLimiter({ channels: 9 }), /channels/);
+});
+
 test('automatic normalization gains are bounded by source peaks and silence gate in both worlds', () => {
     for (const file of ['page-audio-hook.js', 'cs.js']) {
         const src = readFileSync(join(root, file), 'utf8');
         const start = src.indexOf('function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, config) {');
-        const end = src.indexOf(file === 'cs.js' ? 'function sampleIsolatedNormalizer() {' : 'function sampleProcessor(processor) {', start);
+        const end = src.indexOf(file === 'cs.js' ? 'function activeIsolatedMediaCount(pendingElement = null) {' : 'function sampleProcessor(processor) {', start);
         assert.ok(start >= 0 && end > start, file + ': missing gain guard');
-        const update = runInNewContext('(' + src.slice(start, end).trim() + ')');
+        const update = runInNewContext('(' + src.slice(start, end).trim() + '\n)');
         const cfg = { targetDb: -16, maxBoostDb: 12, ceilingDb: -1, responseMs: 600 };
 
         assert.equal(update(12, -65, -50, cfg), 0, 'no boost of quiet background/noise');
@@ -363,6 +491,290 @@ test('automatic normalization gains are bounded by source peaks and silence gate
     }
 });
 
+
+
+test('music leveling preserves dynamics and resets safely while adaptive remains fast', () => {
+    for (const file of ['page-audio-hook.js', 'cs.js']) {
+        const src = readFileSync(join(root, file), 'utf8');
+        const start = src.indexOf('function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, config) {');
+        const end = src.indexOf(file === 'cs.js' ? 'function activeIsolatedMediaCount(pendingElement = null) {' : 'function sampleProcessor(processor) {', start);
+        const gainFor = runInNewContext('(' + src.slice(start, end).trim() + '\n)');
+        const config = { mode: 'music', targetDb: -16, maxBoostDb: 12, ceilingDb: -1, responseMs: 600 };
+        const memory = {};
+        let gain = 0;
+        for (let n = 0; n < 24; n++) gain = gainFor(gain, -30, -20, config, memory);
+        assert.ok(gain <= 0, file + ': no early intro boost');
+        for (let n = 0; n < 90; n++) gain = gainFor(gain, -30, -20, config, memory);
+        assert.ok(gain > 1 && gain <= 12, file + ': steady quiet music should rise slowly');
+        const beforeTransient = gain;
+        gain = gainFor(gain, -12, -13, config, memory);
+        assert.ok(gain >= beforeTransient - 1, file + ': transient should not force an audible volume plunge');
+        const actualDigitalSilence = gain;
+        gain = gainFor(gain, -120, -Infinity, config, memory);
+        assert.equal(gain, actualDigitalSilence, file + ': digital silence must hold gain instead of instantly resetting');
+        // The sampled output reports real digital silence as -Infinity peak,
+        // but malformed live analyser data must still fail to unity.
+        assert.equal(gainFor(8, NaN, NaN, config, {}), 0,
+            file + ': invalid analyser samples never retain stale boost');
+        const beforeSilence = gain;
+        for (let n = 0; n < 10; n++) gain = gainFor(gain, -120, -120, config, memory);
+        assert.equal(gain, beforeSilence, file + ': fade does not pump the gain');
+        for (let n = 0; n < 21; n++) gain = gainFor(gain, -120, -120, config, memory);
+        assert.equal(gain, 0, file + ': extended silence resets gain and history');
+        gain = gainFor(0, -30, -20, config, memory);
+        assert.ok(gain <= 0, file + ': new song starts without stale boost');
+        const quietHistory = {};
+        let heldAttenuation = -15;
+        heldAttenuation = gainFor(heldAttenuation, -24, -22, config, quietHistory);
+        for (let n = 0; n < 42; n++) heldAttenuation = gainFor(heldAttenuation, -120, -Infinity, config, quietHistory);
+        assert.ok(heldAttenuation <= -14 && heldAttenuation >= -15,
+            file + ': dramatic pause must not undo protective attenuation');
+        let boostedBeforeSilence = 12;
+        const boostedHistory = {};
+        boostedBeforeSilence = gainFor(boostedBeforeSilence, -28, -25, config, boostedHistory);
+        for (let n = 0; n < 42; n++) boostedBeforeSilence = gainFor(boostedBeforeSilence, -120, -Infinity, config, boostedHistory);
+        assert.equal(boostedBeforeSilence, 0,
+            file + ': digital silence must discard positive boost before a new loud segment');
+        gain = gainFor(10, -25, -0.1, config, memory);
+        assert.equal(gain, 0, file + ': loud new peak removes positive boost without permanent extra attenuation');
+        const peakHistory = {};
+        let peakLimitedGain = gainFor(0, -35, -0.1, config, peakHistory);
+        assert.equal(peakLimitedGain, 0, file + ': full-scale music without boost must not be attenuated solely for headroom');
+        for (let n = 0; n < 200; n++) peakLimitedGain = gainFor(peakLimitedGain, -35, -25, config, peakHistory);
+        assert.ok(peakLimitedGain > 0, file + ': a lone transient eventually releases its peak hold');
+        assert.ok(peakHistory.peakDb < -16, file + ': stale peak must decay instead of persisting all song');
+        const fast = gainFor(0, -30, -20, { ...config, mode: 'adaptive' }, {});
+        assert.ok(fast > 0, file + ': adaptive responds immediately');
+    }
+});
+
+test('legacy normalizer configurations stay Adaptive while fresh installs default to Music', () => {
+    const context = { URL };
+    runInNewContext(readFileSync(join(root, 'shared.js'), 'utf8'), context);
+    const shared = context.VolumeControlShared;
+    assert.equal(shared.DEFAULT_NORMALIZER_CONFIG.mode, 'music');
+    assert.equal(shared.normalizeNormalizerConfig(shared.DEFAULT_NORMALIZER_CONFIG).mode, 'music');
+    assert.equal(shared.normalizeNormalizerConfig({ targetDb: -16, responseMs: 600 }).mode, 'adaptive');
+    assert.equal(shared.normalizeNormalizerConfig({ mode: 'adaptive' }).mode, 'adaptive');
+    assert.equal(shared.normalizeNormalizerConfig({ mode: 'music' }).mode, 'music');
+    for (const file of ['page-audio-hook.js', 'cs.js']) {
+        const src = readFileSync(join(root, file), 'utf8');
+        assert.match(src, /musicLevelState = null/, file + ': resetting history is required');
+    }
+    const page = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.match(page, /previousNormalizerMode !== state.normalizerConfig.mode/, 'page-mode switches reset graph gain');
+    const content = readFileSync(join(root, 'cs.js'), 'utf8');
+    assert.match(content, /previousNormalizerMode !== tc.settings.normalizerConfig.mode/, 'isolated mode switches reset gain');
+    assert.match(content, /element.addEventListener\('emptied', resetIsolatedSongGain/, 'captured media source swap resets stale gain');
+    assert.match(content, /element.addEventListener\('ended', resetIsolatedSongGain/, 'captured media end resets stale gain');
+    const options = readFileSync(join(root, 'options.js'), 'utf8');
+    assert.match(options, /normalizerResponseMs.disabled = !adaptive/, 'response speed disabled while Music is selected');
+});
+
+test('isolated track boundaries reset stale gain without interrupting another playing media element', () => {
+    const source = readFileSync(join(root, 'cs.js'), 'utf8');
+    const start = source.indexOf('const resetIsolatedSongGain = (event) => {');
+    const end = source.indexOf("element.addEventListener('seeking', resetIsolatedSongGain", start);
+    assert.ok(start > 0 && end > start, 'isolated source-boundary reset must be wired');
+    const current = { paused: true, ended: true, muted: false, volume: 1 };
+    const other = { paused: false, ended: false, muted: false, volume: 1 };
+    const param = {
+        value: 5, cancelScheduledValues() {},
+        setValueAtTime(value) { this.value = value; }
+    };
+    const tc = { vars: {
+        mediaElements: new Set([current, other]),
+        normalizerEnabled: true, normalizerGainDb: 12,
+        musicLevelState: { peakDb: -2 }, normalizerPeakDb: -4,
+        gainNode: { gain: param }, audioCtx: { currentTime: 2 },
+        isolatedOutputUsesLimiter: true, dB: 0, muted: false, isBlocked: false
+    }, settings: { debugMode: false } };
+    const reset = runInNewContext('(() => { ' + source.slice(start, end) +
+        '; return resetIsolatedSongGain; })()', {
+        tc, element: current,
+        isMediaPlaying: el => !el.paused && !el.ended,
+        isAudibleMediaElement: el => !el.muted && el.volume > 0,
+        getGainValue: db => 10 ** (db / 20), log: () => {}
+    });
+    reset();
+    assert.equal(tc.vars.normalizerGainDb, 12, 'playing secondary source keeps its gain');
+    assert.equal(param.value, 5, 'do not cut over the active second source');
+    other.paused = true;
+    reset();
+    assert.equal(tc.vars.normalizerGainDb, 0, 'single-source playlist clears auto gain');
+    assert.equal(tc.vars.musicLevelState, null, 'new song requires fresh loudness history');
+    assert.equal(param.value, 1, 'AudioParam is reset immediately, not after a 100ms tick');
+    tc.vars.normalizerGainDb = -14;
+    tc.vars.musicLevelState = { rmsDb: -4 };
+    reset({ type: 'seeking' });
+    assert.equal(tc.vars.normalizerGainDb, -14, 'seek must keep protective negative gain');
+    assert.ok(Math.abs(param.value - 10 ** (-14 / 20)) < 0.00001,
+        'seek must not briefly jump from negative auto gain to full-scale audio');
+    tc.vars.normalizerGainDb = 12;
+    reset({ type: 'seeking' });
+    assert.equal(tc.vars.normalizerGainDb, 0, 'seek must discard positive automatic boost');
+    assert.equal(param.value, 1);
+});
+
+test('seeking clears stale automatic boost immediately on captured audio routes', () => {
+    const main = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    const isolated = readFileSync(join(root, 'cs.js'), 'utf8');
+    const start = main.indexOf('const resetGainOnSeek = () => {');
+    const end = main.indexOf('            listen("play", applyOnPlay,', start);
+    assert.ok(start >= 0 && end > start, 'MAIN seek handler and event must exist');
+    const el = { paused: false, ended: false };
+    const route = {
+        normalizerGainDb: 12,
+        musicLevelState: { rmsDb: -31, peakDb: -20 },
+        meterPeakDb: -8,
+        sourceGainResetPending: false,
+        outputConnected: true
+    };
+    const state = { normalizerEnabled: true, extensionActive: true, enabled: true };
+    const events = [];
+    const mediaRoutes = new Map([[el, route]]);
+    const wireMediaRoute = r => {
+        events.push('wire');
+        if (r.sourceGainResetPending) {
+            events.push('reset');
+            r.sourceGainResetPending = false;
+        }
+    };
+    const listen = (evt, fn) => { if (evt === 'seeking') events.push(fn); };
+    runInNewContext('(() => { ' + main.slice(start, end) + ' })()', {
+        element: el, state, mediaRoutes, wireMediaRoute, listen,
+        scheduleMediaRouteRecovery: () => events.push('retry')
+    });
+    const seek = events.find(e => typeof e === 'function');
+    assert.equal(typeof seek, 'function');
+    seek();
+    assert.equal(route.normalizerGainDb, 0, 'previous positive music boost cleared on seek');
+    assert.equal(route.musicLevelState, null, 'seek starts new loudness history');
+    assert.equal(route.meterPeakDb, -Infinity);
+    assert.equal(route.sourceGainResetPending, false, 'route resets gain immediately');
+    assert.deepEqual(events.filter(e => typeof e === 'string'), ['wire', 'reset']);
+    route.normalizerGainDb = -12;
+    route.musicLevelState = { peakDb: -8 };
+    seek();
+    assert.equal(route.normalizerGainDb, -12, 'MAIN seek must keep protective attenuation');
+    assert.equal(route.musicLevelState, null, 'MAIN seek starts a fresh history');
+    route.normalizerGainDb = 8;
+    state.normalizerEnabled = false;
+    seek();
+    assert.equal(route.normalizerGainDb, 8, 'Normalize-off playback remains untouched');
+    assert.match(isolated,
+        /element.addEventListener\('seeking', resetIsolatedSongGain, \{ passive: true \}\)/,
+        'isolated captured media seeks reset gain before next 100ms sample');
+});
+
+test('isolated fallback stops unsafe automatic boost when two captured sources play', () => {
+    const source = readFileSync(join(root, 'cs.js'), 'utf8');
+    const start = source.indexOf('function activeIsolatedMediaCount(pendingElement = null) {');
+    const end = source.indexOf('function sampleIsolatedNormalizer() {', start);
+    assert.ok(start >= 0 && end > start, 'concurrent isolated guard must exist');
+    const first = { paused: false, ended: false, muted: false, volume: 1 };
+    const second = { paused: false, ended: false, muted: false, volume: 1 };
+    const captured = new WeakMap([[first, { connected: true }], [second, { connected: false }]]);
+    const param = { value: 3, history: [],
+        cancelScheduledValues(t) { this.history.push(['cancel', t]); },
+        setValueAtTime(value, t) { this.value = value; this.history.push(['set', value, t]); }
+    };
+    const tc = { vars: {
+        mediaElements: new Set([first, second]), capturedMediaSources: captured,
+        normalizerEnabled: true, normalizerGainDb: 12,
+        musicLevelState: { rmsDb: -32 }, audioCtx: { currentTime: 2 },
+        gainNode: { gain: param }, isolatedOutputUsesLimiter: true,
+        dB: 0, muted: false, isBlocked: false
+    }, settings: { debugMode: false } };
+    let limiterUpdates = 0;
+    const fn = runInNewContext('(() => { ' + source.slice(start, end) +
+        '; return { activeIsolatedMediaCount, guardConcurrentIsolatedNormalizer }; })()', {
+        tc, isMediaPlaying: element => !element.paused && !element.ended,
+        isAudibleMediaElement: element => !element.muted && element.volume > 0,
+        getGainValue: db => 10 ** (db / 20),
+        configureIsolatedLimiter: () => { limiterUpdates++; }, log: () => {}
+    });
+    assert.equal(fn.activeIsolatedMediaCount(), 1);
+    assert.equal(fn.guardConcurrentIsolatedNormalizer(), false);
+    assert.equal(tc.vars.normalizerGainDb, 12, 'single playing source is not affected');
+    // Count a freshly captured (but not yet connected) second source before
+    // the first audio block can escape through the shared gain.
+    assert.equal(fn.activeIsolatedMediaCount(second), 2);
+    assert.equal(fn.guardConcurrentIsolatedNormalizer(second), true);
+    assert.equal(tc.vars.normalizerGainDb, 0, 'pending second source must shed AGC before connection');
+    assert.equal(param.value, 1, 'pending source is clamped synchronously');
+    tc.vars.normalizerGainDb = 12;
+    tc.vars.musicLevelState = { rmsDb: -32 };
+    captured.get(second).connected = true;
+    assert.equal(fn.activeIsolatedMediaCount(), 2);
+    assert.equal(fn.guardConcurrentIsolatedNormalizer(), true);
+    assert.equal(tc.vars.normalizerGainDb, 0, 'second source immediately sheds positive AGC');
+    assert.equal(tc.vars.musicLevelState, null, 'mixed audio never reuses track loudness history');
+    assert.equal(param.value, 1, 'AudioParam clamps before next 100ms sampler');
+    assert.equal(limiterUpdates, 2, 'both preconnection and active second-source clamps refresh limiter safety');
+    tc.vars.normalizerGainDb = -9;
+    param.value = 10 ** (-9 / 20);
+    assert.equal(fn.guardConcurrentIsolatedNormalizer(), true);
+    assert.equal(tc.vars.normalizerGainDb, -9, 'existing negative gain remains protective');
+    assert.ok(Math.abs(param.value - 10 ** (-9 / 20)) < 0.00001);
+    tc.vars.normalizerGainDb = 8;
+    tc.vars.dB = 6;
+    assert.equal(fn.guardConcurrentIsolatedNormalizer(), true);
+    assert.ok(Math.abs(param.value - 10 ** (6 / 20)) < 0.00001,
+        'manual boost remains user-controlled under the compressor');
+    second.paused = true;
+    assert.equal(fn.activeIsolatedMediaCount(), 1);
+    assert.equal(fn.guardConcurrentIsolatedNormalizer(), false);
+    const content = source;
+    assert.match(content, /const concurrent = guardConcurrentIsolatedNormalizer\(\)/,
+        'the sampler must not calculate AGC from the combined waveform');
+    assert.match(content, /if \(concurrent\) \{\s*gainDb = Math.min\(0, gainDb\)/);
+    assert.match(content, /guardConcurrentIsolatedNormalizer\(\);[\s\S]*?applyState\(\);/,
+        'newly captured audio must shed old boost before state routing');
+    assert.match(content, /element.addEventListener\('play', \(\) => \{[\s\S]*?guardConcurrentIsolatedNormalizer\(element\);[\s\S]*?reconnectIsolatedCapturedSource\(element\)/,
+        'a returning captured source must clamp before reconnecting, not after it plays');
+    assert.match(content, /tc\.vars\.mediaElements\.add\(element\);\s*\/\/ This captured node[\s\S]*?guardConcurrentIsolatedNormalizer\(element\);\s*const sourceConnected = reconnectIsolatedCapturedSource\(element\)/,
+        'initial MediaElementSource connection must not happen before concurrent AGC clamp');
+});
+
+test('music mode avoids needless compressor reduction at unity while protecting boosted output', () => {
+    const page = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    const isolated = readFileSync(join(root, 'cs.js'), 'utf8');
+    for (const [file, source, startText, endText, scope] of [
+        ['MAIN', page, '    function configureLimiter(processor) {', '    function markNode(node) {', 'main'],
+        ['isolated', isolated, 'function configureIsolatedLimiter() {', 'function computeSafeNormalizerGainDb(', 'isolated']
+    ]) {
+        const start = source.indexOf(startText);
+        const end = source.indexOf(endText, start);
+        assert.ok(start >= 0 && end > start, file + ': compressor configuration block not found');
+        const config = { mode: 'music', targetDb: -16, maxBoostDb: 12, ceilingDb: -1, responseMs: 600 };
+        const limiter = Object.fromEntries(['threshold', 'knee', 'ratio', 'attack', 'release'].map(k => [k, { value: null }]));
+        const state = { normalizerEnabled: true, dB: 0, normalizerConfig: config };
+        const tc = { vars: { limiterNode: limiter, normalizerGainDb: 0, normalizerEnabled: true, dB: 0 },
+            settings: { normalizerConfig: config, debugMode: false } };
+        const fn = runInNewContext('(() => {\n' + source.slice(start, end) +
+            '\nreturn ' + (scope === 'main' ? 'configureLimiter' : 'configureIsolatedLimiter') + ';})()', {
+                state, tc, normalizeNormalizerConfig: () => config, log: () => {}
+            });
+        const configure = (gainDb) => {
+            if (scope === 'main') fn({ limiter, normalizerGainDb: gainDb });
+            else { tc.vars.normalizerGainDb = gainDb; fn(); }
+            return limiter.threshold.value;
+        };
+        assert.equal(configure(0), 0, file + ': unboosted music must not compress near-fullscale peaks');
+        assert.equal(configure(-6), 0, file + ': attenuated music must preserve peak dynamics');
+        assert.equal(configure(3), -1, file + ': automatic boost restores conservative limiter threshold');
+        if (scope === 'main') state.dB = 8;
+        else tc.vars.dB = 8;
+        assert.equal(configure(0), -1, file + ': positive manual boost retains limiter protection');
+        if (scope === 'main') state.dB = 0;
+        else tc.vars.dB = 0;
+        config.mode = 'adaptive';
+        assert.equal(configure(0), -1, file + ': adaptive mode keeps original limiter behavior');
+    }
+    assert.match(page, /if \(!Number.isFinite\(sample\)\) throw new Error\("invalid source sample"\)/);
+    assert.match(isolated, /if \(!Number.isFinite\(sample\)\) throw new Error\("invalid source sample"\)/);
+});
 
 test('MAIN-world graph failures restore clamped direct output, then retry limiting', () => {
     const source = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
@@ -936,6 +1348,15 @@ test('fallback mute never claims a site-owned native mute', () => {
     assert.match(source, /if \(element\.dataset\.vcNativeMuted === 'true'\) \{/);
 });
 
+test('Chromium smoke retries only an actual startup timeout with separate profiles', () => {
+    const source = readFileSync(join(root, 'scripts/browser-smoke.mjs'), 'utf8');
+    assert.match(source, /attempt <= 2/);
+    assert.match(source, /chrome-profile-.*attempt/);
+    assert.match(source, /run\.error && run\.error\.code === 'ETIMEDOUT' && attempt === 1/);
+    assert.match(source, /if \(run\.error\) throw run\.error/);
+    assert.match(source, /run\.status !== 0 \|\| !output\.includes\('VC_BROWSER_SMOKE_PASS'\)/);
+});
+
 test('Firefox audio smoke waits for state transitions instead of fixed 60ms timing', () => {
     const source = readFileSync(join(root, 'scripts/firefox-smoke.mjs'), 'utf8');
     assert.match(source, /const waitFor = async/);
@@ -951,6 +1372,126 @@ test('Firefox audio hook smoke uses an HTTP origin for bridge messages', () => {
     assert.doesNotMatch(source, /pathToFileURL/);
 });
 
+
+test('experimental true-peak is off by default and runs only after explicit opt-in', () => {
+    const source = readFileSync(join(root, 'shared.js'), 'utf8');
+    const context = { URL };
+    runInNewContext(source, context);
+    const shared = context.VolumeControlShared;
+    assert.equal(shared.DEFAULT_NORMALIZER_CONFIG.experimentalTruePeak, false);
+    assert.equal(shared.normalizeNormalizerConfig({}).experimentalTruePeak, false);
+    assert.equal(shared.normalizeNormalizerConfig({ experimentalTruePeak: 'true' }).experimentalTruePeak, false);
+    assert.equal(shared.normalizeNormalizerConfig({ experimentalTruePeak: true }).experimentalTruePeak, true);
+    const options = readFileSync(join(root, 'options.html'), 'utf8');
+    assert.match(options, /id="normalizerTruePeakExperimental"/);
+    assert.match(options, /isolated fallback only/);
+    const src = readFileSync(join(root, 'page-audio-hook.js'), 'utf8');
+    assert.doesNotMatch(src, /new AudioWorkletNode\(/, 'MAIN routes must keep compressor behavior');
+});
+
+test('isolated opt-in switches only its output edge and recovers failed worklet routing', () => {
+    const source = readFileSync(join(root, 'cs.js'), 'utf8');
+    const start = source.indexOf('function routeIsolatedOutput() {');
+    const end = source.indexOf('function applyState() {', start);
+    const node = id => ({
+        id, edges: [], port: { messages: [], postMessage(msg) { this.messages.push(msg); } },
+        connect(to) { if (this.fail) throw Error('connect refused'); this.edges.push(to); },
+        disconnect() { this.edges = []; }
+    });
+    const gainNode = node('gain'), limiterNode = node('compressor');
+    const analyserNode = node('analyser'), truePeakNode = node('worklet');
+    const destination = {};
+    gainNode.gain = { value: 1, cancelScheduledValues() {},
+        setValueAtTime(value) { this.value = value; } };
+    const tc = { vars: { audioCtx: { destination, currentTime: 3 },
+        gainNode, limiterNode, analyserNode, truePeakNode, truePeakStatus: 'idle',
+        normalizerEnabled: true, muted: false, isBlocked: false, dB: 8,
+        isolatedOutputUsesLimiter: null, isolatedOutputRouteKind: null
+    }, settings: { debugMode: false,
+        normalizerConfig: { experimentalTruePeak: true, ceilingDb: -1 } } };
+    const wire = runInNewContext('(' + source.slice(start, end).trim() + ')', {
+        tc, configureIsolatedLimiter: () => {}, getGainValue: dB => 10 ** (dB / 20),
+        log: () => {}
+    });
+    wire();
+    assert.equal(tc.vars.isolatedOutputRouteKind, 'compressor',
+        'not-yet-loaded worklet cannot displace safe compressor');
+    assert.equal(gainNode.edges[0], limiterNode);
+    tc.vars.truePeakStatus = 'ready';
+    wire();
+    assert.equal(tc.vars.isolatedOutputRouteKind, 'worklet');
+    assert.equal(tc.vars.isolatedOutputUsesLimiter, true);
+    assert.equal(gainNode.edges[0], truePeakNode);
+    assert.equal(truePeakNode.edges[0], analyserNode);
+    assert.equal(analyserNode.edges[0], destination);
+    assert.ok(truePeakNode.port.messages.some(x => x.type === 'reset'));
+    assert.ok(truePeakNode.port.messages.some(x => x.type === 'set-ceiling' && x.ceilingDb === -1));
+    tc.vars.normalizerGainDb = 12;
+    truePeakNode.fail = true;
+    tc.vars.isolatedOutputRouteKind = null;
+    wire();
+    assert.equal(tc.vars.truePeakStatus, 'failed');
+    assert.equal(tc.vars.isolatedOutputRouteKind, 'compressor',
+        'failed experimental worklet must recover via compressor before direct');
+    assert.equal(tc.vars.isolatedOutputUsesLimiter, true);
+    assert.equal(gainNode.edges[0], limiterNode);
+    assert.equal(limiterNode.edges[0], analyserNode);
+    tc.settings.normalizerConfig.experimentalTruePeak = false;
+    wire();
+    assert.equal(tc.vars.isolatedOutputRouteKind, 'compressor');
+});
+
+test('isolated worklet load waits for user opt-in and fails back without stale events', async () => {
+    const src = readFileSync(join(root, 'cs.js'), 'utf8');
+    const start = src.indexOf('function disableIsolatedTruePeak(reason) {');
+    const end = src.indexOf('function routeIsolatedOutput() {', start);
+    assert.ok(start >= 0 && end > start);
+    const urls = [];
+    const fakeContext = { state: 'running', audioWorklet: {
+        async addModule(url) { urls.push(url); }
+    } };
+    const state = { experimentalTruePeak: false, ceilingDb: -1 };
+    const tc = { vars: { audioCtx: fakeContext, limiterNode: {},
+        normalizerEnabled: true, dB: 0, muted: false, isBlocked: false,
+        isolatedOutputRouteKind: 'compressor', truePeakStatus: 'idle',
+        truePeakNode: undefined }, settings: { debugMode: false, normalizerConfig: state } };
+    let applies = 0, recoveries = 0;
+    class AudioWorkletNode {
+        constructor(context, name, options) {
+            assert.equal(context, fakeContext);
+            assert.equal(name, 'volume-control-true-peak');
+            assert.equal(options.outputChannelCount[0], 2);
+            this.port = { postMessage() {}, onmessage: null };
+        }
+        disconnect() {}
+    }
+    const fn = runInNewContext('(() => {' + src.slice(start, end) +
+        ';return { prepareIsolatedTruePeak, disableIsolatedTruePeak };})()', {
+            tc, AudioWorkletNode, normalizeNormalizerConfig: value => value,
+            browserAPI: { runtime: { getURL: path => 'moz-extension://abc/' + path } },
+            applyState: () => { applies++; },
+            routeIsolatedOutput: () => { recoveries++; },
+            log: () => {}
+        });
+    fn.prepareIsolatedTruePeak();
+    assert.equal(urls.length, 0, 'disabled experiment cannot initialize module');
+    state.experimentalTruePeak = true;
+    fn.prepareIsolatedTruePeak();
+    fn.prepareIsolatedTruePeak();
+    await tc.vars.truePeakLoadPromise;
+    assert.equal(urls.length, 1, 'only one module load per context');
+    assert.equal(tc.vars.truePeakStatus, 'ready');
+    assert.equal(applies, 1);
+    const oldNode = tc.vars.truePeakNode;
+    tc.vars.isolatedOutputRouteKind = 'worklet';
+    oldNode.port.onmessage({ data: { type: 'limiter-error', message: 'DSP failed' } });
+    assert.equal(tc.vars.truePeakStatus, 'failed');
+    assert.equal(recoveries, 1);
+    assert.equal(applies, 2);
+    tc.vars.truePeakStatus = 'ready';
+    oldNode.onprocessorerror();
+    assert.equal(recoveries, 1, 'stale node cannot disable a replacement');
+});
 
 test('isolated audio restores a gain-limited direct path after limiter route failures', () => {
     const source = readFileSync(join(root, 'cs.js'), 'utf8');
@@ -1211,6 +1752,10 @@ test('normalizer popup preserves saved preference while disabling unsupported DR
     const checkbox = { checked: true, disabled: false,
         closest: () => panel, setAttribute: (name, val) => { attributes[name] = val; } };
     const details = { hidden: false };
+    const warningTransitions = [];
+    const peakWarning = { classList: { toggle(name, hidden) {
+        warningTransitions.push({ name, hidden });
+    } } };
     const note = { textContent: '', classList };
     const cached = {
         normalizerCheckbox: checkbox, normalizerNote: note,
@@ -1218,7 +1763,9 @@ test('normalizer popup preserves saved preference while disabling unsupported DR
     };
     const apply = runInNewContext('(' + source.slice(start, end).trim() + ')', {
         cached,
-        document: { querySelector: () => null, getElementById: () => details },
+        document: { querySelector: () => null,
+            getElementById: id => id === 'normalizer-details' ? details
+                : id === 'peak-safety-warning' ? peakWarning : null },
         formatMeterDb: () => '−∞ dBFS'
     });
 
@@ -1257,6 +1804,64 @@ test('normalizer popup preserves saved preference while disabling unsupported DR
     assert.equal(attributes['aria-disabled'], 'false');
     assert.equal(details.hidden, false, 'saved enabled preference resumes with the meter');
     assert.ok(toggles.some(x => x.name === 'hidden' && x.enabled === true));
+    apply({ peakDb: -0.2 });
+    assert.deepEqual(warningTransitions.at(-1), { name: 'hidden', hidden: false },
+        'warn about near-full-scale observed sample peaks');
+    apply({ peakDb: -1.2 });
+    assert.deepEqual(warningTransitions.at(-1), { name: 'hidden', hidden: true },
+        'hide warning with output headroom');
+    apply({ peakDb: -0.1, normalizerAvailable: false });
+    assert.deepEqual(warningTransitions.at(-1), { name: 'hidden', hidden: true },
+        'unroutable audio must not imply clipping');
+    apply({ peakDb: null, normalizerAvailable: true });
+    assert.deepEqual(warningTransitions.at(-1), { name: 'hidden', hidden: true },
+        'unknown peaks cannot imply clipping');
+});
+
+test('positive manual boost warning works independently of Normalize', () => {
+    const src = readFileSync(join(root, 'popup.js'), 'utf8');
+    const html = readFileSync(join(root, 'popup.html'), 'utf8');
+    const start = src.indexOf('function setDisplayedVolume(dB) {');
+    const end = src.indexOf('function shortcutToAria(shortcut) {', start);
+    assert.ok(start > 0 && end > start);
+    const slider = { value: '0' };
+    const text = { value: '0' };
+    let warningHidden = true;
+    const warning = { classList: { toggle(key, hide) {
+        assert.equal(key, 'hidden'); warningHidden = hide;
+    } } };
+    const cached = { slider, volumeText: text, maxDb: 32 };
+    const setDisplayed = runInNewContext('(' + src.slice(start, end).trim() + ')', {
+        cached,
+        normalizeControlDb: v => Math.max(-32, Math.min(32, Math.round(v))),
+        document: { querySelector: id => id === '#volume-boost-warning' ? warning : null }
+    });
+    setDisplayed(0);
+    assert.equal(warningHidden, true);
+    setDisplayed(5);
+    assert.equal(warningHidden, true);
+    setDisplayed(6);
+    assert.equal(warningHidden, false);
+    setDisplayed(24);
+    assert.equal(warningHidden, false);
+    assert.equal(slider.value, '24');
+    setDisplayed(-6);
+    assert.equal(warningHidden, true);
+    assert.match(html, /id="volume-boost-warning"/);
+    assert.match(html, /volume-limit-note volume-boost-warning/);
+});
+
+test('peak safety labels do not promise a hard compressor ceiling', () => {
+    const html = readFileSync(join(root, 'popup.html'), 'utf8');
+    const options = readFileSync(join(root, 'options.html'), 'utf8');
+    const popup = readFileSync(join(root, 'popup.js'), 'utf8');
+    const docs = readFileSync(join(root, 'README.md'), 'utf8');
+    assert.match(html, /id="peak-safety-warning"/);
+    assert.match(html, /reference mark, not a hard ceiling/);
+    assert.match(options, /Compressor threshold/);
+    assert.doesNotMatch(options, /<span>Limiter ceiling<\/span>/);
+    assert.match(popup, /peakDb < -0\.3/);
+    assert.match(docs, /not\*\* a certified BS\.1770 true-peak meter/);
 });
 
 test('Normalize warning stays outside the folded meter and DRM fallback note mentions it', () => {
@@ -1401,7 +2006,7 @@ test('limiter ceiling updates without reconnecting an unchanged audio route', ()
     assert.match(page, /function wireGraph\(graph\) \{[\s\S]*?configureLimiter\(graph\);/);
     assert.match(page, /graph\.currentMode === wantMode[\s\S]*?setGainValue\(graph\)/);
     assert.match(page, /function wireMediaRoute\(route\) \{[\s\S]*?configureLimiter\(route\);[\s\S]*?route\.currentMode === wantMode && route\.outputConnected/);
-    assert.match(isolated, /if \(tc\.vars\.isolatedOutputUsesLimiter\) configureIsolatedLimiter\(\);\s*routeIsolatedOutput\(\);/);
+    assert.match(isolated, /if \(tc\.vars\.isolatedOutputUsesLimiter\) configureIsolatedLimiter\(\);\s*prepareIsolatedTruePeak\(\);\s*routeIsolatedOutput\(\);/);
 });
 
 test('normalization off bypasses compressor but positive boosts retain limiting', () => {
@@ -1557,6 +2162,8 @@ test('reused media source resets stale automatic gain before next track and fail
     let disconnected = false;
     const reset = runInNewContext('(' + page.slice(start, end).trim() + ')', {
         effectiveGain: () => manual,
+        dbToGain: db => 10 ** (db / 20),
+        state: { normalizerEnabled: true },
         disconnectMediaRouteOutput: route => { disconnected = true; route.outputConnected = false; },
         log: () => {}
     });
@@ -2179,7 +2786,7 @@ test('isolated captured source retries original node after both initial connect 
     assert.equal(captured.connected, true);
     assert.equal(element.dataset.vcFallbackReason, undefined);
     assert.match(content, /capturedMediaSources\.set\(element,\s*\{/);
-    assert.match(content, /element\.dataset\.vcHooked = "true";\s*tc\.vars\.mediaElements\.add\(element\);\s*const sourceConnected = reconnectIsolatedCapturedSource\(element\)/);
+    assert.match(content, /element\.dataset\.vcHooked = "true";\s*tc\.vars\.mediaElements\.add\(element\);[\s\S]*?guardConcurrentIsolatedNormalizer\(element\);\s*const sourceConnected = reconnectIsolatedCapturedSource\(element\)/);
 });
 
 
@@ -3448,4 +4055,29 @@ test('MAIN sampler reconciles when an AudioContext resumes without a new play ev
         await ops.resumeContext(context);
         assert.deepEqual(events.slice(-2), ['resume','sample']);
     });
+});
+
+
+test('streaming workflow fails closed when required decoded-media coverage disappears', () => {
+    const probe = readFileSync(join(root, 'scripts/chromium-real-sites.mjs'), 'utf8');
+    const workflow = readFileSync(join(root, '.github/workflows/real-sites.yml'), 'utf8');
+    const release = readFileSync(join(root, '.github/workflows/daily-prerelease.yml'), 'utf8');
+    const ci = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
+    assert.match(probe, /const missingRequired = required\.filter/);
+    for (const scenario of ['Downloaded real audio', 'Downloaded real video',
+        'Concurrent decoded MP3 and MP4', 'Real MP4 same-element playlist transition']) {
+        assert.ok(probe.includes(scenario), scenario + ' must be a required scenario');
+    }
+    assert.match(probe, /missingRequired\.length\) \{/);
+    assert.match(probe, /GITHUB_STEP_SUMMARY/);
+    assert.match(probe, /Number\.isFinite\(meter\?\.peakDb\)/);
+    for (const name of ['manifest.json', 'popup.html', 'popup.css',
+        'options.html', 'options.css', 'scripts/build.ps1', 'scripts/minify.mjs']) {
+        assert.equal(workflow.split("'" + name + "'").length, 3,
+            name + ' must trigger both push and pull-request streaming probes');
+    }
+    assert.match(release, /node scripts\/chromium-functional-smoke\.mjs/);
+    assert.match(release, /node scripts\/firefox-extension-smoke\.mjs/);
+    assert.match(release, /Create SHA-256 checksums/);
+    assert.match(ci, /cancel-in-progress:.*github\.ref/);
 });

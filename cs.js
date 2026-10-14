@@ -66,7 +66,12 @@ const tc = {
     normalizerEnabled: false,
     normalizerPeakDb: -Infinity,
     normalizerGainDb: 0,
+    musicLevelState: null,
     isolatedOutputUsesLimiter: null,
+    isolatedOutputRouteKind: null,
+    truePeakStatus: 'idle',
+    truePeakNode: undefined,
+    truePeakLoadPromise: null,
     audioCtx: undefined,
     gainNode: undefined,
     inputAnalyserNode: undefined,
@@ -148,6 +153,7 @@ if (browserAPI) {
                     // A previous song may have accumulated +12 dB auto gain.
                     // Never replay it immediately when normalization resumes.
                     tc.vars.normalizerGainDb = 0;
+                    tc.vars.musicLevelState = null;
                     tc.vars.normalizerPeakDb = -Infinity;
                 }
                 tc.vars.normalizerEnabled = Boolean(msg.enabled);
@@ -525,6 +531,7 @@ function invalidateBoostLimitCache() {
                 !getNormalizerAvailability().available;
             if (unavailable && tc.vars.normalizerGainDb !== 0) {
                 tc.vars.normalizerGainDb = 0;
+                tc.vars.musicLevelState = null;
                 tc.vars.normalizerPeakDb = -Infinity;
                 applyState();
             } else if (next !== tc.vars.dB) {
@@ -1026,17 +1033,90 @@ function sendPageAudioHeartbeat() {
     }
 }
 
+function disableIsolatedTruePeak(reason) {
+    const vars = tc.vars;
+    vars.truePeakStatus = 'failed';
+    const node = vars.truePeakNode;
+    vars.truePeakNode = undefined;
+    try { if (node) node.disconnect(); } catch (e) {}
+    if (tc.settings.debugMode) log(`experimental true-peak fallback: ${reason}`, 3);
+    if (vars.isolatedOutputRouteKind === 'worklet') {
+        // Recover an existing captured media route through the compressor;
+        // never create a second MediaElementAudioSourceNode.
+        vars.isolatedOutputRouteKind = null;
+        routeIsolatedOutput();
+        applyState();
+    }
+}
+
+function prepareIsolatedTruePeak() {
+    const vars = tc.vars;
+    const ctx = vars.audioCtx;
+    const config = normalizeNormalizerConfig(tc.settings.normalizerConfig);
+    if (!config.experimentalTruePeak || vars.isBlocked || !ctx || !vars.limiterNode ||
+        !(vars.normalizerEnabled || (!vars.muted && vars.dB > 0))) return;
+    if (vars.truePeakStatus === 'ready') {
+        try { vars.truePeakNode.port.postMessage({ type: 'set-ceiling', ceilingDb: config.ceilingDb }); }
+        catch (e) { disableIsolatedTruePeak(e && e.message); }
+        return;
+    }
+    if (vars.truePeakStatus === 'failed' || vars.truePeakStatus === 'loading') return;
+    if (!ctx.audioWorklet || typeof AudioWorkletNode !== 'function' ||
+        !browserAPI || !browserAPI.runtime || typeof browserAPI.runtime.getURL !== 'function') {
+        vars.truePeakStatus = 'failed';
+        return;
+    }
+    let moduleUrl;
+    try { moduleUrl = browserAPI.runtime.getURL('true-peak-worklet.js'); }
+    catch (e) { vars.truePeakStatus = 'failed'; return; }
+    vars.truePeakStatus = 'loading';
+    vars.truePeakLoadPromise = Promise.resolve().then(() => ctx.audioWorklet.addModule(moduleUrl))
+        .then(() => {
+            if (vars.audioCtx !== ctx || ctx.state === 'closed') return;
+            const node = new AudioWorkletNode(ctx, 'volume-control-true-peak', {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                outputChannelCount: [2],
+                channelCount: 2,
+                channelCountMode: 'explicit',
+                processorOptions: { channels: 2, ceilingDb: config.ceilingDb }
+            });
+            node.onprocessorerror = () => {
+                if (vars.truePeakNode === node && vars.audioCtx === ctx)
+                    disableIsolatedTruePeak('processorerror');
+            };
+            node.port.onmessage = event => {
+                if (vars.truePeakNode === node && vars.audioCtx === ctx &&
+                    event.data && event.data.type === 'limiter-error') {
+                    disableIsolatedTruePeak(event.data.message || 'DSP error');
+                }
+            };
+            vars.truePeakNode = node;
+            vars.truePeakStatus = 'ready';
+            applyState();
+        }).catch(e => {
+            if (vars.audioCtx === ctx) disableIsolatedTruePeak(e && e.message || 'module unavailable');
+        }).finally(() => {
+            if (vars.audioCtx === ctx) vars.truePeakLoadPromise = null;
+        });
+}
+
 function routeIsolatedOutput() {
-    const { audioCtx, gainNode, limiterNode, analyserNode } = tc.vars;
+    const { audioCtx, gainNode, limiterNode, analyserNode, truePeakNode } = tc.vars;
     if (!audioCtx || !gainNode || !limiterNode || !analyserNode) return;
     const useLimiter = !tc.vars.isBlocked &&
         (tc.vars.normalizerEnabled || (!tc.vars.muted && tc.vars.dB > 0));
-    if (tc.vars.isolatedOutputUsesLimiter === useLimiter) return;
+    // Configuration was normalized on storage load. Keep disabled-by-default
+    // behavior even if a test or legacy startup has not populated it yet.
+    const configured = tc.settings.normalizerConfig || {};
+    const truePeakReady = configured.experimentalTruePeak &&
+        tc.vars.truePeakStatus === 'ready' && Boolean(truePeakNode);
+    const routeKind = !useLimiter ? 'direct' : truePeakReady ? 'worklet' : 'compressor';
+    if (tc.vars.isolatedOutputUsesLimiter === useLimiter &&
+        tc.vars.isolatedOutputRouteKind === routeKind) return;
 
     if (!useLimiter) {
-        // Disabling Normalize or positive boost can remove the compressor.
-        // Clamp the active (possibly boosted) AudioParam BEFORE connecting
-        // directly to the destination; the later 15ms UI ramp is too late.
+        // Clamp the boosted AudioParam BEFORE any direct connection.
         try {
             const param = gainNode.gain;
             const now = audioCtx.currentTime;
@@ -1045,49 +1125,69 @@ function routeIsolatedOutput() {
             param.cancelScheduledValues(now);
             param.setValueAtTime(safeGain, now);
         } catch (e) {
-            if (tc.settings.debugMode) log(`isolated direct route safety clamp failed: ${e && e.message}`, 3);
-            // Keep existing limited audio connected rather than allowing an
-            // uncontrolled gain burst through an unprotected direct path.
+            if (tc.settings.debugMode) log(`isolated direct route clamp failed: ${e && e.message}`, 3);
             return;
         }
     }
-
-    // Disconnect only outgoing edges: media element source -> gain remains
-    // intact, even while a player is actively playing.
-    for (const node of [gainNode, limiterNode, analyserNode]) {
-        try { node.disconnect(); } catch (e) {}
+    // Preserve the captured MediaElementSource -> inputAnalyser -> gain.
+    // Only disconnect output edges; never re-create irreversible sources.
+    for (const node of [gainNode, limiterNode, truePeakNode, analyserNode]) {
+        try { if (node) node.disconnect(); } catch (e) {}
     }
     try {
         if (useLimiter) {
-            configureIsolatedLimiter();
-            gainNode.connect(limiterNode);
-            limiterNode.connect(analyserNode);
+            const processor = routeKind === 'worklet' ? truePeakNode : limiterNode;
+            if (routeKind === 'worklet') {
+                processor.port.postMessage({ type: 'reset' });
+                processor.port.postMessage({ type: 'set-ceiling', ceilingDb: configured.ceilingDb });
+            } else {
+                configureIsolatedLimiter();
+            }
+            gainNode.connect(processor);
+            processor.connect(analyserNode);
             analyserNode.connect(audioCtx.destination);
         } else {
             gainNode.connect(audioCtx.destination);
         }
         tc.vars.isolatedOutputUsesLimiter = useLimiter;
+        tc.vars.isolatedOutputRouteKind = routeKind;
     } catch (e) {
-        // A partial rebuild must not leave captured media permanently silent.
-        // Discard partial edges and attempt a direct, gain-limited fallback.
+        // If the experimental node fails to connect, keep the existing
+        // compressor as the *first* fallback. Direct output comes last.
         tc.vars.isolatedOutputUsesLimiter = null;
-        tc.vars.normalizerGainDb = 0;
-        tc.vars.normalizerPeakDb = -Infinity;
-        for (const node of [gainNode, limiterNode, analyserNode]) {
-            try { node.disconnect(); } catch (_) {}
+        tc.vars.isolatedOutputRouteKind = null;
+        for (const node of [gainNode, limiterNode, truePeakNode, analyserNode]) {
+            try { if (node) node.disconnect(); } catch (_) {}
         }
+        if (routeKind === 'worklet' && useLimiter) {
+            tc.vars.truePeakStatus = 'failed';
+            tc.vars.truePeakNode = undefined;
+            try {
+                configureIsolatedLimiter();
+                gainNode.connect(limiterNode);
+                limiterNode.connect(analyserNode);
+                analyserNode.connect(audioCtx.destination);
+                tc.vars.isolatedOutputUsesLimiter = true;
+                tc.vars.isolatedOutputRouteKind = 'compressor';
+                if (tc.settings.debugMode) log('True-peak route failed; compressor restored', 3);
+                return;
+            } catch (compressorError) {
+                for (const node of [gainNode, limiterNode, analyserNode]) {
+                    try { if (node) node.disconnect(); } catch (_) {}
+                }
+            }
+        }
+        tc.vars.normalizerGainDb = 0;
+        tc.vars.musicLevelState = null;
+        tc.vars.normalizerPeakDb = -Infinity;
         try {
-            // Clamp the existing AudioParam BEFORE reconnecting directly.
-            // A 15ms ramp in applyState() is too late: a previously boosted
-            // gain could otherwise play briefly without limiter protection.
-            const gainParam = gainNode.gain;
+            const param = gainNode.gain;
             const now = audioCtx.currentTime;
-            gainParam.cancelScheduledValues(now);
-            gainParam.setValueAtTime(
-                Math.max(0, Math.min(1, gainParam.value)), now
-            );
+            param.cancelScheduledValues(now);
+            param.setValueAtTime(Math.max(0, Math.min(1, param.value)), now);
             gainNode.connect(audioCtx.destination);
             tc.vars.isolatedOutputUsesLimiter = false;
+            tc.vars.isolatedOutputRouteKind = 'direct';
         } catch (fallbackError) {
             if (tc.settings.debugMode) log(`isolated output fallback failed: ${fallbackError && fallbackError.message}`, 3);
         }
@@ -1098,6 +1198,9 @@ function routeIsolatedOutput() {
 function applyState() {
     enforceBoostLimit();
     syncPageAudioHook();
+    // A newly playing second captured source must not inherit auto boost
+    // even if this state sync precedes the next normalizer sample.
+    guardConcurrentIsolatedNormalizer();
 
     const audioCtx = tc.vars.audioCtx;
     const gainNode = tc.vars.gainNode;
@@ -1110,6 +1213,7 @@ function applyState() {
         // The limiter may remain routed during manual boost while Normalize
         // is off. Changes from Options must still update its parameters.
         if (tc.vars.isolatedOutputUsesLimiter) configureIsolatedLimiter();
+        prepareIsolatedTruePeak();
         routeIsolatedOutput();
         // If the limiter failed and audio was restored directly, do not
         // expose automatic gain or positive manual boost without protection.
@@ -1206,7 +1310,12 @@ function configureIsolatedLimiter() {
     if (!limiter) return;
     const config = normalizeNormalizerConfig(tc.settings.normalizerConfig);
     try {
-        limiter.threshold.value = config.ceilingDb;
+        // Avoid unnecessary compression of already-unboosted music.
+        // A fixed compressor route prevents clicks from frequent rewiring.
+        const transparentMusic = tc.vars.normalizerEnabled && config.mode === "music" &&
+            tc.vars.dB <= 0 && (!Number.isFinite(tc.vars.normalizerGainDb) ||
+                tc.vars.normalizerGainDb <= 0);
+        limiter.threshold.value = transparentMusic ? 0 : config.ceilingDb;
         limiter.knee.value = 0;
         limiter.ratio.value = 20;
         limiter.attack.value = 0.003;
@@ -1217,26 +1326,138 @@ function configureIsolatedLimiter() {
 }
 
 function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, config) {
-        // Never amplify the noise floor or reuse stale gain if the analyser
-        // reports silence/errors. This is intentionally independent of the
-        // volume slider so users retain control of the final output level.
-        if (!Number.isFinite(sourceRmsDb) || sourceRmsDb <= -55 ||
-            !Number.isFinite(sourcePeakDb)) return 0;
-
-        const previous = Number.isFinite(previousDb) ? previousDb : 0;
-        // Leave a 2 dB sample-peak margin below the requested compressor
-        // threshold. This reduces sudden overshoot; it is NOT a hard or
-        // inter-sample true-peak guarantee (WebAudio compressors aren't).
-        const rmsTarget = config.targetDb - sourceRmsDb;
-        const peakHeadroom = config.ceilingDb - 2 - sourcePeakDb;
-        const desired = Math.max(-32, Math.min(config.maxBoostDb, rmsTarget, peakHeadroom));
-
-        // Loudness jumps must shed existing boost immediately. Raising gain
-        // is deliberately much slower to avoid pumping from brief quiet gaps.
-        if (desired <= previous) return desired;
-        const alpha = 1 - Math.exp(-100 / Math.max(100, config.responseMs));
-        return previous + (desired - previous) * alpha;
+    // The detector is upstream of the manual slider, in both audio worlds.
+    // Fifth argument: per-route history; without it retain legacy adaptive behavior.
+    const history = arguments[4];
+    const previous = Number.isFinite(previousDb) ? previousDb : 0;
+    if (history && history.mode !== config.mode) {
+        history.mode = config.mode;
+        history.rmsDb = null;
+        history.peakDb = -Infinity;
+        history.peakHoldSamples = 0;
+        history.audibleSamples = 0;
+        history.silentSamples = 0;
     }
+    // Digital silence is reported as RMS=-120, peak=-Infinity: valid silence,
+    // NOT an analyser failure. Still fail closed on NaN or non-silent bad peaks.
+    if (!Number.isFinite(sourceRmsDb) || Number.isNaN(sourcePeakDb) ||
+        sourcePeakDb === Infinity || (sourceRmsDb > -55 && !Number.isFinite(sourcePeakDb))) {
+        if (history) {
+            history.rmsDb = null;
+            history.peakDb = -Infinity;
+            history.peakHoldSamples = 0;
+            history.audibleSamples = 0;
+            history.silentSamples = 0;
+        }
+        return 0;
+    }
+    if (sourceRmsDb <= -55) {
+        // Don't pump up a music fade or gap between phrases. After 3 seconds
+        // of silence, discard boost history without dropping safe attenuation.
+        if (config.mode === "music" && history && history.audibleSamples > 0 &&
+            ++history.silentSamples < 30) return previous;
+        if (history) {
+            history.rmsDb = null;
+            history.peakDb = -Infinity;
+            history.peakHoldSamples = 0;
+            history.audibleSamples = 0;
+            history.silentSamples = 0;
+        }
+        // Positive boost could overload the next loud passage; negative
+            // attenuation should survive a silent dramatic pause instead
+            // of suddenly returning to full-scale after three seconds.
+            return config.mode === "music" ? Math.min(0, previous) : 0;
+    }
+
+    if (config.mode === "music" && history) {
+        history.silentSamples = 0;
+        history.audibleSamples = Math.min(1000, (history.audibleSamples || 0) + 1);
+        if (!Number.isFinite(history.rmsDb)) history.rmsDb = sourceRmsDb;
+        // A slow, asymmetrical envelope follows the overall program, not the
+        // 100 ms kick/snare cycle. Do not count pauses/silence as quiet music.
+        const rmsTimeMs = sourceRmsDb > history.rmsDb ? 3500 : 11000;
+        history.rmsDb += (sourceRmsDb - history.rmsDb) *
+            (1 - Math.exp(-100 / rmsTimeMs));
+        // Peak envelope: hold for four seconds, then release by 1.5 dB/s.
+        // A permanent sample-peak maximum made one transient suppress a full song.
+        if (!Number.isFinite(history.peakDb) || sourcePeakDb >= history.peakDb) {
+            history.peakDb = sourcePeakDb;
+            history.peakHoldSamples = 40;
+        } else if (history.peakHoldSamples > 0) {
+            history.peakHoldSamples--;
+        } else {
+            history.peakDb = Math.max(sourcePeakDb, history.peakDb - 0.15);
+        }
+        // Excess peaks must prevent extra automatic boost, not make otherwise
+        // unamplified music quieter merely for having a full-scale sample.
+        const safeBoostDb = Math.max(0, Math.min(
+            config.maxBoostDb, config.ceilingDb - 2 - history.peakDb));
+        const desired = Math.max(-32, Math.min(
+            config.targetDb - history.rmsDb, safeBoostDb,
+            history.audibleSamples < 25 ? 0 : Infinity));
+        // Immediately shed unsafe positive automatic boost after a fresh peak.
+        // The existing compressor protects residual input peaks, with its documented limits.
+        const instantaneousBoostLimit = Math.max(0, config.ceilingDb - 2 - sourcePeakDb);
+        if (previous > 0 && instantaneousBoostLimit < previous) {
+            return Math.max(-32, Math.min(desired, instantaneousBoostLimit));
+        }
+        const timeMs = desired < previous ? 1600 : 6000;
+        return previous + (desired - previous) * (1 - Math.exp(-100 / timeMs));
+    }
+
+    // Adaptive mode retains the original fast voice/video leveling behavior.
+    const rmsTarget = config.targetDb - sourceRmsDb;
+    const peakHeadroom = config.ceilingDb - 2 - sourcePeakDb;
+    const desired = Math.max(-32, Math.min(config.maxBoostDb, rmsTarget, peakHeadroom));
+    if (desired <= previous) return desired;
+    const alpha = 1 - Math.exp(-100 / Math.max(100, config.responseMs));
+    return previous + (desired - previous) * alpha;
+}
+
+// Unlike MAIN-world MediaElement routes, the isolated fallback mixes all
+// captured elements BEFORE one input analyser and gain. Its RMS is therefore
+// not a per-player measurement. When multiple captured sources play, disable
+// automatic positive boost rather than letting a quiet video amplify a loud
+// one. Full independent per-source leveling requires separately owned graphs.
+function activeIsolatedMediaCount(pendingElement = null) {
+    let count = 0;
+    for (const element of tc.vars.mediaElements || []) {
+        const captured = tc.vars.capturedMediaSources && tc.vars.capturedMediaSources.get(element);
+        if (!captured || (!captured.connected && element !== pendingElement) ||
+            !isMediaPlaying(element) || !isAudibleMediaElement(element)) continue;
+        if (++count >= 2) break;
+    }
+    return count;
+}
+
+function guardConcurrentIsolatedNormalizer(pendingElement = null) {
+    if (!tc.vars.normalizerEnabled || activeIsolatedMediaCount(pendingElement) < 2) return false;
+    const previous = Number(tc.vars.normalizerGainDb) || 0;
+    // Keep existing attenuation; removing it could expose a previously
+    // quieted track at full volume. No new gain history from a mixed signal.
+    tc.vars.normalizerGainDb = Math.min(0, previous);
+    tc.vars.musicLevelState = null;
+    if (previous > 0 && tc.vars.gainNode && tc.vars.audioCtx) {
+        try {
+            // Clamp synchronously at the second play event. Waiting for the
+            // 100ms sampler lets boosted audio leak for an audible fragment.
+            const manual = tc.vars.isBlocked ? 1 :
+                tc.vars.muted ? 0 : getGainValue(tc.vars.dB);
+            const safe = tc.vars.isolatedOutputUsesLimiter === true
+                ? manual : Math.min(1, manual);
+            const param = tc.vars.gainNode.gain;
+            const now = tc.vars.audioCtx.currentTime;
+            param.cancelScheduledValues(now);
+            param.setValueAtTime(Math.max(0, safe), now);
+            configureIsolatedLimiter();
+        } catch (e) {
+            if (tc.settings.debugMode) log(`concurrent media gain clamp failed: ${e && e.message}`, 2);
+            // Preserve the attempted zero-auto-gain control state; applyState()
+            // retries restoring the clamped output when the graph recovers.
+        }
+    }
+    return true;
+}
 
 function sampleIsolatedNormalizer() {
     if (!tc.vars.normalizerEnabled) return;
@@ -1271,26 +1492,36 @@ function sampleIsolatedNormalizer() {
     }
     let sourceRmsDb = -120;
     let sourcePeakDb = -Infinity;
+    let sourceReadValid = false;
     try {
         sourceAnalyser.getFloatTimeDomainData(tc.vars.inputAnalyserBuffer);
         let sourceSum = 0;
         let sourcePeak = 0;
         for (let i = 0; i < tc.vars.inputAnalyserBuffer.length; i++) {
             const sample = tc.vars.inputAnalyserBuffer[i];
+            if (!Number.isFinite(sample)) throw new Error("invalid source sample");
             sourceSum += sample * sample;
             sourcePeak = Math.max(sourcePeak, Math.abs(sample));
         }
         const sourceRms = Math.sqrt(sourceSum / Math.max(1, tc.vars.inputAnalyserBuffer.length));
         sourceRmsDb = sourceRms > 0.000001 ? 20 * Math.log10(sourceRms) : -120;
         sourcePeakDb = sourcePeak > 0.000001 ? 20 * Math.log10(sourcePeak) : -Infinity;
+        sourceReadValid = true;
     } catch (e) {}
 
     const config = normalizeNormalizerConfig(tc.settings.normalizerConfig);
+    // This fallback measures a mixed source. Never normalize two active
+    // captured elements as though they were one song.
+    const concurrent = guardConcurrentIsolatedNormalizer();
     let gainDb = Number(tc.vars.normalizerGainDb) || 0;
     const previousGainDb = gainDb;
-    if (tc.vars.normalizerEnabled && !tc.vars.muted && !tc.vars.isBlocked &&
+    if (concurrent) {
+        gainDb = Math.min(0, gainDb);
+    } else if (tc.vars.normalizerEnabled && !tc.vars.muted && !tc.vars.isBlocked &&
         tc.vars.isolatedOutputUsesLimiter === true) {
-        gainDb = computeSafeNormalizerGainDb(gainDb, sourceRmsDb, sourcePeakDb, config);
+        gainDb = computeSafeNormalizerGainDb(gainDb, sourceReadValid ? sourceRmsDb : NaN,
+            sourceReadValid ? sourcePeakDb : NaN, config,
+            tc.vars.musicLevelState || (tc.vars.musicLevelState = {}));
     } else {
         gainDb = 0;
     }
@@ -1369,6 +1600,7 @@ function createGainNode() {
         tc.vars.limiterNode = limiter;
         tc.vars.analyserNode = analyser;
         tc.vars.isolatedOutputUsesLimiter = null;
+        tc.vars.isolatedOutputRouteKind = null;
         // applyState() wires the output only once a complete graph exists.
         ensureIsolatedNormalizerTimer();
     }
@@ -1683,6 +1915,9 @@ function connectOutput(element) {
             return;
         }
         if (tc.vars.mediaElements) tc.vars.mediaElements.add(element);
+        // Clamp before a previously captured route reconnects; otherwise its
+        // first block can play at another source's old positive gain.
+        guardConcurrentIsolatedNormalizer(element);
         // Retry the original node, never create a second MediaElementSource.
         if (!reconnectIsolatedCapturedSource(element)) scheduleIsolatedCapturedSourceRetry(element);
         if (isMediaPlaying(element) && tc.vars.audioCtx.state === 'suspended') {
@@ -1735,6 +1970,10 @@ function connectOutput(element) {
         tc.vars.inputAnalyserNode = undefined;
         tc.vars.inputAnalyserBuffer = undefined;
         tc.vars.limiterNode = undefined;
+        tc.vars.truePeakNode = undefined;
+        tc.vars.truePeakStatus = 'idle';
+        tc.vars.truePeakLoadPromise = null;
+        tc.vars.isolatedOutputRouteKind = null;
         tc.vars.analyserNode = undefined;
         tc.vars.analyserBuffer = undefined;
         if (tc.vars.normalizerTimer !== null) {
@@ -1824,17 +2063,57 @@ function connectOutput(element) {
             // repeated attempts cannot create another MediaElementSource.
             element.dataset.vcHooked = "true";
             tc.vars.mediaElements.add(element);
+            // This captured node is not connected yet. Count it provisionally
+            // so a second playing source cannot leak the first source's boost
+            // on its very first decoded audio block.
+            guardConcurrentIsolatedNormalizer(element);
             const sourceConnected = reconnectIsolatedCapturedSource(element);
             if (!sourceConnected) scheduleIsolatedCapturedSourceRetry(element);
 
             // Wake up the AudioContext when media starts playing
             element.addEventListener('play', () => {
+                guardConcurrentIsolatedNormalizer(element);
                 if (!reconnectIsolatedCapturedSource(element)) return;
                 if (tc.vars.audioCtx && tc.vars.audioCtx.state === 'suspended') {
                     resumeAudioContext();
                 }
             });
 
+            // Isolated world has one gain for all captured media. A song
+            // boundary must clear stale boost before the next track plays,
+            // but never disrupt another concurrently playing captured source.
+            const resetIsolatedSongGain = (event) => {
+                if (!tc.vars.normalizerEnabled) return;
+                for (const other of tc.vars.mediaElements) {
+                    if (other !== element && isMediaPlaying(other) && isAudibleMediaElement(other)) return;
+                }
+                // A seek within the same song should retain existing
+                // attenuation but must NEVER carry positive automatic gain
+                // into a suddenly loud section.
+                const previousDb = Number(tc.vars.normalizerGainDb) || 0;
+                const retainedDb = event && event.type === 'seeking'
+                    ? Math.min(0, previousDb) : 0;
+                tc.vars.normalizerGainDb = retainedDb;
+                tc.vars.musicLevelState = null;
+                tc.vars.normalizerPeakDb = -Infinity;
+                if (!tc.vars.gainNode || !tc.vars.audioCtx) return;
+                try {
+                    const manual = tc.vars.isBlocked ? 1 : tc.vars.muted ? 0 : getGainValue(tc.vars.dB);
+                    const combined = manual * Math.pow(10, retainedDb / 20);
+                    const safeGain = tc.vars.isolatedOutputUsesLimiter === true
+                        ? combined : Math.min(1, combined);
+                    const now = tc.vars.audioCtx.currentTime;
+                    tc.vars.gainNode.gain.cancelScheduledValues(now);
+                    tc.vars.gainNode.gain.setValueAtTime(safeGain, now);
+                } catch (e) {
+                    if (tc.settings.debugMode) log(`song-boundary gain reset failed: ${e && e.message}`, 3);
+                }
+            };
+            // Seeking can jump from quiet intro to loud chorus without a
+            // source/ended event. Reset captured gain before it resumes.
+            element.addEventListener('seeking', resetIsolatedSongGain, { passive: true });
+            element.addEventListener('ended', resetIsolatedSongGain, { passive: true });
+            element.addEventListener('emptied', resetIsolatedSongGain, { passive: true });
             // Suspend the AudioContext when media stops to release the Bluetooth lock
             const checkSuspend = () => setTimeout(suspendAudioContextIfIdle, 250);
             for (const evt of ['volumechange', 'pause', 'ended', 'emptied']) {
@@ -1845,6 +2124,7 @@ function connectOutput(element) {
             // captured source actually has a working WebAudio connection.
             if (sourceConnected) clearFallbackVolume(element);
 
+            guardConcurrentIsolatedNormalizer();
             applyState();
             checkSuspend();
 
@@ -2011,13 +2291,22 @@ async function start() {
         if (!isTopFrame() && controlUrl) profileControlUrl = controlUrl;
         const currentDomain = extractRootDomain(controlUrl);
         const siteSettingsKey = applyEffectiveDebugSettings(data, controlUrl);
+        const previousNormalizerMode = tc.settings.normalizerConfig && tc.settings.normalizerConfig.mode;
         tc.settings.normalizerConfig = normalizeNormalizerConfig(data.normalizerConfig);
+        // Applying new loudness rules must not reuse automatic boost earned
+        // under the old mode, even until the next 100 ms meter tick.
+        if (previousNormalizerMode !== tc.settings.normalizerConfig.mode) {
+            tc.vars.normalizerGainDb = 0;
+            tc.vars.musicLevelState = null;
+            tc.vars.normalizerPeakDb = -Infinity;
+        }
         const normalizerSettingsKey = getSiteSettingsKey(data.siteNormalizerSettings || {}, controlUrl);
         const resolvedNormalizerEnabled = normalizerSettingsKey
             ? Boolean(data.siteNormalizerSettings[normalizerSettingsKey]?.enabled)
             : Boolean(data.normalizerDefaultEnabled);
         if (tc.vars.normalizerEnabled !== resolvedNormalizerEnabled) {
             tc.vars.normalizerGainDb = 0;
+            tc.vars.musicLevelState = null;
             tc.vars.normalizerPeakDb = -Infinity;
         }
         tc.vars.normalizerEnabled = resolvedNormalizerEnabled;
@@ -2052,6 +2341,7 @@ async function start() {
         // 100ms normalizer sampler clears its previous +dB gain.
         if (tc.vars.isBlocked !== blocked) {
             tc.vars.normalizerGainDb = 0;
+            tc.vars.musicLevelState = null;
             tc.vars.normalizerPeakDb = -Infinity;
             lastSyncedPageAudioState = null;
         }

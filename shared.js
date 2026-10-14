@@ -30,10 +30,12 @@
 
     const BRIDGE_VERSION = 3;
     const DEFAULT_NORMALIZER_CONFIG = Object.freeze({
+        mode: "music",
         targetDb: -16,
         maxBoostDb: 12,
         ceilingDb: -1,
-        responseMs: 600
+        responseMs: 600,
+        experimentalTruePeak: false
     });
 
     function normalizeNormalizerConfig(value = {}) {
@@ -49,10 +51,12 @@
             return Number.isFinite(n) ? n : fallback;
         };
         return {
+            mode: value.mode === "music" ? "music" : "adaptive", // Legacy saved configs without a mode remain Adaptive.
             targetDb: Math.max(-30, Math.min(-6, numberOr(value.targetDb, DEFAULT_NORMALIZER_CONFIG.targetDb))),
             maxBoostDb: Math.max(0, Math.min(24, numberOr(value.maxBoostDb, DEFAULT_NORMALIZER_CONFIG.maxBoostDb))),
             ceilingDb: Math.max(-6, Math.min(-0.1, numberOr(value.ceilingDb, DEFAULT_NORMALIZER_CONFIG.ceilingDb))),
-            responseMs: Math.max(100, Math.min(3000, Math.round(numberOr(value.responseMs, DEFAULT_NORMALIZER_CONFIG.responseMs))))
+            responseMs: Math.max(100, Math.min(3000, Math.round(numberOr(value.responseMs, DEFAULT_NORMALIZER_CONFIG.responseMs)))),
+            experimentalTruePeak: value.experimentalTruePeak === true
         };
     }
 
