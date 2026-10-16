@@ -725,10 +725,20 @@ function stopFrameReporting() {
     if (isTopFrame()) frameLimitReports.clear();
 }
 
+// Sites sometimes detach a video while it continues producing audio. Even if
+// Volume Control made its native fallback temporarily silent, it must remain
+// tracked so a later unmute/dB change can restore it without reinsertion.
+function shouldRetainDetachedMediaElement(element) {
+    if (!element || !isMediaPlaying(element)) return false;
+    if (isAudibleMediaElement(element)) return true;
+    const dataset = element.dataset;
+    return Boolean(dataset && (dataset.vcFallback === 'true' || dataset.vcHooked === 'true'));
+}
+
 function sweepKnownMediaElements() {
     for (const element of Array.from(tc.vars.knownMediaElements || [])) {
         if (element && element.isConnected) continue;
-        if (element && isMediaPlaying(element) && isAudibleMediaElement(element)) continue;
+        if (shouldRetainDetachedMediaElement(element)) continue;
         if (element && element.dataset && element.dataset.vcFallback === 'true') {
             clearFallbackVolume(element);
         }
@@ -887,11 +897,12 @@ function applyFallbackVolume(element, reason = "") {
             // Already in fallback mode. If the page changed element.volume out
             // from under us (e.g., the page's own volume slider), update
             // __vc_originalVolume to reflect the page's intent.
-            const origBase = element.__vc_originalVolume !== undefined
-                ? element.__vc_originalVolume
-                : currentVolume;
-            const expectedScaled = Math.min(1, Math.max(0, origBase * Math.min(gain, 1)));
-            if (Math.abs(currentVolume - expectedScaled) > 0.05) {
+            // Compare against OUR previous native write, not an estimate using
+            // the CURRENT extension gain. Comparing with the new gain mistook
+            // dB changes for site slider changes; the old 0.05 dead zone also
+            // swallowed small movements of native player controls.
+            const lastApplied = element.__vc_lastAppliedVolume;
+            if (Number.isFinite(lastApplied) && Math.abs(currentVolume - lastApplied) > 0.000001) {
                 element.__vc_originalVolume = currentVolume;
             }
         }
@@ -906,34 +917,22 @@ function applyFallbackVolume(element, reason = "") {
     }
 
     try {
-        // Native mute: when the extension is muted, set element.muted = true
-        // so the browser can release the OS audio device handle (important for
-        // Bluetooth headphones that stay active while a media element plays).
-        // We still restore __vc_originalVolume below so unmuting is clean.
-        if (tc.vars.muted) {
-            // Only claim ownership when we actually change the native mute.
-            // A site-muted element must stay muted when Volume Control unmutes.
-            if (element.dataset.vcNativeMuted !== 'true' && !element.muted) {
-                element.muted = true;
-                element.dataset.vcNativeMuted = 'true';
-            }
-            if (tc.settings.debugMode) element.style.border = "2px dashed #ffa500";
-            return;
-        }
-        // Unmute ONLY a native mute WE applied. Blanket-unmuting any muted
-        // element overrode the SITE's own mute (muted autoplay ads, the site's
-        // mute button): our fallback loop has no isAudible gate, so with
-        // attenuation active a site-muted element was force-unmuted.
-        if (element.dataset.vcNativeMuted === 'true') {
-            element.muted = false;
-            delete element.dataset.vcNativeMuted;
-        }
-
+        // The isolated fallback cannot intercept the page's own muted setter.
+        // Writing element.muted here loses the distinction between a site mute
+        // and an extension mute: unmuting the extension could then unmute a
+        // site-muted ad or player. Apply extension mute as native volume=0,
+        // preserve the site-owned .muted flag, and restore its slider level
+        // from __vc_originalVolume when the extension is unmuted.
+        // This rare DRM/CORS fallback cannot release the OS audio handle by
+        // muting natively, but it must never change the page's mute intent.
         const baseVolume = element.__vc_originalVolume !== undefined
             ? element.__vc_originalVolume
             : (gain > 1 ? 1 : element.volume);
         const newVol = Math.min(1, Math.max(0, baseVolume * Math.min(gain, 1)));
+        // Save the value actually written so the next volumechange can tell a
+        // native player-slider gesture from our own fallback correction.
         element.volume = newVol;
+        element.__vc_lastAppliedVolume = newVol;
         if (tc.settings.debugMode) element.style.border = "2px dashed #ffa500";
     } catch (e) {
         log(`Fallback volume set failed: ${e && e.message}`, 2);
@@ -945,17 +944,28 @@ function clearFallbackVolume(element) {
 
     try {
         if (element.__vc_originalVolume !== undefined) {
-            element.volume = element.__vc_originalVolume;
+            const currentVolume = element.volume;
+            const lastApplied = element.__vc_lastAppliedVolume;
+            // A paused, muted, or disconnected player can change its native
+            // volume without our playback handler running. Do not overwrite
+            // that newer player choice with an old fallback snapshot when the
+            // user resets to 0 dB or disables the extension.
+            if (Number.isFinite(currentVolume) &&
+                (!Number.isFinite(lastApplied) ||
+                    Math.abs(currentVolume - lastApplied) > 0.000001)) {
+                element.__vc_originalVolume = currentVolume;
+            }
+            if (Math.abs(element.volume - element.__vc_originalVolume) > 0.000001) {
+                element.volume = element.__vc_originalVolume;
+            }
         }
-        // Clear any native mute WE applied while in fallback mode (only ours —
-        // never the site's own muted element; see applyFallbackVolume).
-        if (element.dataset.vcNativeMuted === 'true') {
-            element.muted = false;
-            delete element.dataset.vcNativeMuted;
-        }
+        // Extension muting uses volume=0, so there is no native mute flag to
+        // undo. Never set element.muted=false on teardown: it might now be a
+        // site-owned mute that the extension did not observe.
     } catch (e) {}
 
     delete element.__vc_originalVolume;
+    delete element.__vc_lastAppliedVolume;
     delete element.dataset.vcFallback;
     delete element.dataset.vcFallbackReason;
     delete element.dataset.vcNativeMuted;
@@ -1260,12 +1270,17 @@ function applyState() {
             // detach their <video> during player rebuilds while playback
             // continues; dropping those would freeze any fallback volume we
             // applied and stop later state changes from reaching them.
-            if (!el.isConnected) {
-                if (!(isMediaPlaying(el) && isAudibleMediaElement(el))) {
-                    tc.vars.knownMediaElements.delete(el);
-                }
+            if (!el.isConnected && !shouldRetainDetachedMediaElement(el)) {
+                // An idle detached fallback must be restored before dropping
+                // our last strong reference; otherwise it can resume later at
+                // the extension's old attenuation without being tracked.
+                if (el.dataset && el.dataset.vcFallback === 'true') clearFallbackVolume(el);
+                tc.vars.knownMediaElements.delete(el);
                 continue;
             }
+            // Still-playing detached elements take the SAME update path as
+            // connected elements. Retention without applying new dB/mute was
+            // leaving audible detached videos stuck at stale native volume.
             if (isPageAudioManaged(el)) {
                 if (el.dataset.vcFallback === 'true') clearFallbackVolume(el);
                 continue;
