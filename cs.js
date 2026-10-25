@@ -1341,10 +1341,29 @@ function configureIsolatedLimiter() {
 }
 
 function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, config) {
-    // The detector is upstream of the manual slider, in both audio worlds.
-    // Fifth argument: per-route history; without it retain legacy adaptive behavior.
+    // Fifth argument: per-route history. Sixth/seventh: debug logging and route label.
     const history = arguments[4];
+    const diagnosticsEnabled = arguments[5] === true;
+    const diagnosticRoute = typeof arguments[6] === "string" ? arguments[6] : "unknown";
     const previous = Number.isFinite(previousDb) ? previousDb : 0;
+    function logDiagnostic(desiredGainDb, appliedGainDb, stage = "active") {
+        if (!diagnosticsEnabled || !history || typeof console === "undefined" ||
+            typeof console.debug !== "function") return;
+        const now = Date.now();
+        if (Number.isFinite(history.lastDiagnosticAt) && now - history.lastDiagnosticAt < 95) return;
+        history.lastDiagnosticAt = now;
+        const roundDb = value => Number.isFinite(value) ? Number(value.toFixed(2)) : value;
+        console.debug("[Volume Control][Normalizer]", {
+            route: diagnosticRoute,
+            mode: config.mode,
+            stage,
+            inputRmsDb: roundDb(sourceRmsDb),
+            inputPeakDb: roundDb(sourcePeakDb),
+            peakEnvelopeDb: roundDb(history.peakDb),
+            desiredGainDb: roundDb(desiredGainDb),
+            appliedGainDb: roundDb(appliedGainDb)
+        });
+    }
     if (history && history.mode !== config.mode) {
         history.mode = config.mode;
         history.rmsDb = null;
@@ -1352,9 +1371,9 @@ function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, conf
         history.peakHoldSamples = 0;
         history.audibleSamples = 0;
         history.silentSamples = 0;
+        history.lastDiagnosticAt = null;
     }
-    // Digital silence is reported as RMS=-120, peak=-Infinity: valid silence,
-    // NOT an analyser failure. Still fail closed on NaN or non-silent bad peaks.
+    // Digital silence is valid analyser data. Fail closed only on invalid measurements.
     if (!Number.isFinite(sourceRmsDb) || Number.isNaN(sourcePeakDb) ||
         sourcePeakDb === Infinity || (sourceRmsDb > -55 && !Number.isFinite(sourcePeakDb))) {
         if (history) {
@@ -1364,13 +1383,16 @@ function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, conf
             history.audibleSamples = 0;
             history.silentSamples = 0;
         }
+        logDiagnostic(0, 0, "invalid-input");
         return 0;
     }
     if (sourceRmsDb <= -55) {
-        // Don't pump up a music fade or gap between phrases. After 3 seconds
-        // of silence, discard boost history without dropping safe attenuation.
+        // Don't pump up a fade or gap. Preserve attenuation briefly, then clear boost history.
         if (config.mode === "music" && history && history.audibleSamples > 0 &&
-            ++history.silentSamples < 30) return previous;
+            ++history.silentSamples < 30) {
+            logDiagnostic(previous, previous, "silence-hold");
+            return previous;
+        }
         if (history) {
             history.rmsDb = null;
             history.peakDb = -Infinity;
@@ -1378,23 +1400,24 @@ function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, conf
             history.audibleSamples = 0;
             history.silentSamples = 0;
         }
-        // Positive boost could overload the next loud passage; negative
-            // attenuation should survive a silent dramatic pause instead
-            // of suddenly returning to full-scale after three seconds.
-            return config.mode === "music" ? Math.min(0, previous) : 0;
+        const silentGain = config.mode === "music" ? Math.min(0, previous) : 0;
+        logDiagnostic(silentGain, silentGain, "silence");
+        return silentGain;
     }
 
     if (config.mode === "music" && history) {
         history.silentSamples = 0;
         history.audibleSamples = Math.min(1000, (history.audibleSamples || 0) + 1);
         if (!Number.isFinite(history.rmsDb)) history.rmsDb = sourceRmsDb;
-        // A slow, asymmetrical envelope follows the overall program, not the
-        // 100 ms kick/snare cycle. Do not count pauses/silence as quiet music.
-        const rmsTimeMs = sourceRmsDb > history.rmsDb ? 3500 : 11000;
+
+        // Follow section changes promptly; gain smoothing below handles audible transitions.
+        // Loudness envelope: 350 ms attack for louder sections, 900 ms release for quieter ones.
+        const rmsTimeMs = sourceRmsDb > history.rmsDb ? 350 : 900;
         history.rmsDb += (sourceRmsDb - history.rmsDb) *
             (1 - Math.exp(-100 / rmsTimeMs));
-        // Peak envelope: hold for four seconds, then release by 1.5 dB/s.
-        // A permanent sample-peak maximum made one transient suppress a full song.
+
+        // Hold transient peaks for four seconds, then release by 1.5 dB/s.
+        // This envelope limits positive boost only; it must never add attenuation.
         if (!Number.isFinite(history.peakDb) || sourcePeakDb >= history.peakDb) {
             history.peakDb = sourcePeakDb;
             history.peakHoldSamples = 40;
@@ -1403,37 +1426,42 @@ function computeSafeNormalizerGainDb(previousDb, sourceRmsDb, sourcePeakDb, conf
         } else {
             history.peakDb = Math.max(sourcePeakDb, history.peakDb - 0.15);
         }
-        // Excess peaks must prevent extra automatic boost, not make otherwise
-        // unamplified music quieter merely for having a full-scale sample.
         const safeBoostDb = Math.max(0, Math.min(
             config.maxBoostDb, config.ceilingDb - 2 - history.peakDb));
+        const rmsTargetDb = config.targetDb - history.rmsDb;
+        // Apply peak headroom only when the loudness target asks for positive gain.
+        const desiredTargetDb = rmsTargetDb > 0
+            ? Math.min(rmsTargetDb, safeBoostDb)
+            : rmsTargetDb;
         const desired = Math.max(-32, Math.min(
-            config.targetDb - history.rmsDb, safeBoostDb,
-            history.audibleSamples < 25 ? 0 : Infinity));
-        // Immediately shed unsafe positive automatic boost after a fresh peak.
-        // The existing compressor protects residual input peaks, with its documented limits.
+            desiredTargetDb, history.audibleSamples < 25 ? 0 : Infinity));
+
+        // A fresh peak sheds unsafe positive boost immediately; it never demands attenuation.
         const instantaneousBoostLimit = Math.max(0, config.ceilingDb - 2 - sourcePeakDb);
         if (previous > 0 && instantaneousBoostLimit < previous) {
-            return Math.max(-32, Math.min(desired, instantaneousBoostLimit));
+            const applied = Math.max(-32, Math.min(desired, instantaneousBoostLimit));
+            logDiagnostic(desired, applied);
+            return applied;
         }
-        const timeMs = desired < previous ? 1600 : 6000;
-        return previous + (desired - previous) * (1 - Math.exp(-100 / timeMs));
+
+        // Recover prior attenuation smoothly, but keep actual positive boost deliberately gradual.
+        const timeMs = desired < previous ? 1600 : previous < 0 && desired > previous && history.audibleSamples >= 25 ? 900 : 6000;
+        const applied = previous + (desired - previous) * (1 - Math.exp(-100 / timeMs));
+        logDiagnostic(desired, applied);
+        return applied;
     }
 
     // Adaptive mode retains the original fast voice/video leveling behavior.
     const rmsTarget = config.targetDb - sourceRmsDb;
     const peakHeadroom = config.ceilingDb - 2 - sourcePeakDb;
     const desired = Math.max(-32, Math.min(config.maxBoostDb, rmsTarget, peakHeadroom));
-    if (desired <= previous) return desired;
-    const alpha = 1 - Math.exp(-100 / Math.max(100, config.responseMs));
-    return previous + (desired - previous) * alpha;
+    const applied = desired <= previous
+        ? desired
+        : previous + (desired - previous) * (1 - Math.exp(-100 / Math.max(100, config.responseMs)));
+    logDiagnostic(desired, applied);
+    return applied;
 }
 
-// Unlike MAIN-world MediaElement routes, the isolated fallback mixes all
-// captured elements BEFORE one input analyser and gain. Its RMS is therefore
-// not a per-player measurement. When multiple captured sources play, disable
-// automatic positive boost rather than letting a quiet video amplify a loud
-// one. Full independent per-source leveling requires separately owned graphs.
 function activeIsolatedMediaCount(pendingElement = null) {
     let count = 0;
     for (const element of tc.vars.mediaElements || []) {
@@ -1473,6 +1501,7 @@ function guardConcurrentIsolatedNormalizer(pendingElement = null) {
     }
     return true;
 }
+
 
 function sampleIsolatedNormalizer() {
     if (!tc.vars.normalizerEnabled) return;
@@ -1536,7 +1565,7 @@ function sampleIsolatedNormalizer() {
         tc.vars.isolatedOutputUsesLimiter === true) {
         gainDb = computeSafeNormalizerGainDb(gainDb, sourceReadValid ? sourceRmsDb : NaN,
             sourceReadValid ? sourcePeakDb : NaN, config,
-            tc.vars.musicLevelState || (tc.vars.musicLevelState = {}));
+            tc.vars.musicLevelState || (tc.vars.musicLevelState = {}), tc.settings.debugMode, "isolated-fallback");
     } else {
         gainDb = 0;
     }
