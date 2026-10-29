@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-28T15:13:52.190Z",
-  "repository": "Chaython/volumecontrol",
+  "generatedAt": "2026-10-29T08:23:19.185Z",
+  "repository": "Gitoffthelawn/volumecontrol",
   "firefox": {
     "status": "available",
     "addonName": {
@@ -25,188 +25,20 @@
   },
   "github": {
     "status": "available",
-    "stars": 99,
-    "forks": 16,
-    "watchers": 3,
-    "url": "https://github.com/Chaython/volumecontrol",
+    "stars": 1,
+    "forks": 0,
+    "watchers": 0,
+    "url": "https://github.com/Gitoffthelawn/volumecontrol",
     "traffic": {
-      "status": "available",
-      "views": [
-        {
-          "timestamp": "2026-10-14T00:00:00Z",
-          "count": 4,
-          "uniques": 3
-        },
-        {
-          "timestamp": "2026-10-15T00:00:00Z",
-          "count": 1,
-          "uniques": 1
-        },
-        {
-          "timestamp": "2026-10-16T00:00:00Z",
-          "count": 25,
-          "uniques": 8
-        },
-        {
-          "timestamp": "2026-10-17T00:00:00Z",
-          "count": 7,
-          "uniques": 5
-        },
-        {
-          "timestamp": "2026-10-18T00:00:00Z",
-          "count": 1,
-          "uniques": 1
-        },
-        {
-          "timestamp": "2026-10-19T00:00:00Z",
-          "count": 5,
-          "uniques": 2
-        },
-        {
-          "timestamp": "2026-10-20T00:00:00Z",
-          "count": 4,
-          "uniques": 3
-        },
-        {
-          "timestamp": "2026-10-21T00:00:00Z",
-          "count": 0,
-          "uniques": 0
-        },
-        {
-          "timestamp": "2026-10-22T00:00:00Z",
-          "count": 6,
-          "uniques": 4
-        },
-        {
-          "timestamp": "2026-10-23T00:00:00Z",
-          "count": 2,
-          "uniques": 2
-        },
-        {
-          "timestamp": "2026-10-24T00:00:00Z",
-          "count": 7,
-          "uniques": 5
-        },
-        {
-          "timestamp": "2026-10-25T00:00:00Z",
-          "count": 19,
-          "uniques": 6
-        },
-        {
-          "timestamp": "2026-10-26T00:00:00Z",
-          "count": 8,
-          "uniques": 6
-        },
-        {
-          "timestamp": "2026-10-27T00:00:00Z",
-          "count": 8,
-          "uniques": 5
-        }
-      ],
-      "totalViews": 97,
-      "uniqueVisitors": 50,
-      "clones": [
-        {
-          "timestamp": "2026-10-14T00:00:00Z",
-          "count": 65,
-          "uniques": 28
-        },
-        {
-          "timestamp": "2026-10-15T00:00:00Z",
-          "count": 308,
-          "uniques": 175
-        },
-        {
-          "timestamp": "2026-10-16T00:00:00Z",
-          "count": 105,
-          "uniques": 48
-        },
-        {
-          "timestamp": "2026-10-17T00:00:00Z",
-          "count": 142,
-          "uniques": 58
-        },
-        {
-          "timestamp": "2026-10-18T00:00:00Z",
-          "count": 10,
-          "uniques": 7
-        },
-        {
-          "timestamp": "2026-10-19T00:00:00Z",
-          "count": 3,
-          "uniques": 3
-        },
-        {
-          "timestamp": "2026-10-20T00:00:00Z",
-          "count": 7,
-          "uniques": 6
-        },
-        {
-          "timestamp": "2026-10-21T00:00:00Z",
-          "count": 8,
-          "uniques": 7
-        },
-        {
-          "timestamp": "2026-10-22T00:00:00Z",
-          "count": 5,
-          "uniques": 4
-        },
-        {
-          "timestamp": "2026-10-23T00:00:00Z",
-          "count": 4,
-          "uniques": 4
-        },
-        {
-          "timestamp": "2026-10-24T00:00:00Z",
-          "count": 24,
-          "uniques": 15
-        },
-        {
-          "timestamp": "2026-10-25T00:00:00Z",
-          "count": 798,
-          "uniques": 300
-        },
-        {
-          "timestamp": "2026-10-26T00:00:00Z",
-          "count": 106,
-          "uniques": 53
-        },
-        {
-          "timestamp": "2026-10-27T00:00:00Z",
-          "count": 3,
-          "uniques": 3
-        }
-      ],
-      "totalClones": 1588,
-      "uniqueCloners": 643,
-      "referrers": [
-        {
-          "referrer": "Google",
-          "count": 18,
-          "uniques": 11
-        },
-        {
-          "referrer": "prod.outgoing.prod.webservices.mozgcp.net",
-          "count": 5,
-          "uniques": 5
-        },
-        {
-          "referrer": "github.com",
-          "count": 5,
-          "uniques": 3
-        },
-        {
-          "referrer": "search.brave.com",
-          "count": 3,
-          "uniques": 1
-        },
-        {
-          "referrer": "addons.mozilla.org",
-          "count": 2,
-          "uniques": 2
-        }
-      ],
-      "error": null
+      "status": "needs_token",
+      "views": [],
+      "totalViews": null,
+      "uniqueVisitors": null,
+      "clones": [],
+      "totalClones": null,
+      "uniqueCloners": null,
+      "referrers": [],
+      "error": "Configure GH_TRAFFIC_TOKEN with repository Administration: read permission."
     }
   }
 }
